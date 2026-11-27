@@ -22,6 +22,10 @@ import (
 //   - only managers may delete tasks
 //   - archived projects reject all writes                      -> 409
 //   - a task ID that is not in the path project               -> 404
+//   - moving a task needs write access to the task in its
+//     source project (as for updates), and write access to the
+//     destination project; the task keeps its ID, title, status
+//     and assignee; the destination must differ from the source
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -42,6 +46,7 @@ func newServer() http.Handler {
 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
+	mux.HandleFunc("POST /projects/{pid}/tasks/{tid}/move", s.moveTask)
 	return mux
 }
 
@@ -281,4 +286,75 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.DeleteTask(task.ID)
 	w.WriteHeader(204)
+}
+
+type moveRequest struct {
+	ToProjectID string `json:"toProjectId"`
+}
+
+func (s *server) moveTask(w http.ResponseWriter, r *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	user := s.store.User(r.Header.Get("X-User"))
+	if user == nil {
+		writeError(w, 401, "unauthenticated")
+		return
+	}
+	project := s.store.Project(r.PathValue("pid"))
+	if project == nil || project.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	role := s.store.Role(project.ID, user.ID)
+	if role == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	task := s.store.Task(r.PathValue("tid"))
+	if task == nil || task.ProjectID != project.ID {
+		writeError(w, 404, "not found")
+		return
+	}
+	if role != RoleManager && role != RoleContributor {
+		writeError(w, 403, "forbidden")
+		return
+	}
+	if role == RoleContributor && task.Assignee != user.ID {
+		writeError(w, 403, "contributors may only move their own tasks")
+		return
+	}
+	if project.Archived {
+		writeError(w, 409, "project is archived")
+		return
+	}
+	var req moveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.ToProjectID == project.ID {
+		writeError(w, 400, "task is already in that project")
+		return
+	}
+	dest := s.store.Project(req.ToProjectID)
+	if dest == nil || dest.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	destRole := s.store.Role(dest.ID, user.ID)
+	if destRole == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	if destRole != RoleManager && destRole != RoleContributor {
+		writeError(w, 403, "forbidden in destination project")
+		return
+	}
+	if dest.Archived {
+		writeError(w, 409, "destination project is archived")
+		return
+	}
+	task.ProjectID = dest.ID
+	writeJSON(w, 200, task)
 }

@@ -19,6 +19,7 @@ go test ./...
 | GET | `/projects/{pid}/tasks/{tid}` | |
 | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
 | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+| POST | `/projects/{pid}/tasks/{tid}/move` | `{"toProjectId"}` → 200 with the moved task |
 
 Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 
@@ -32,6 +33,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Only managers may delete tasks.
 - Archived projects reject all writes with 409 (reads still work).
 - A task ID that does not belong to the project in the path → 404.
+- Moving a task (`toProjectId`) needs the same write access to the task in its source project as an update does. The user also needs write access (`contributor` or `manager`) in the destination project: not a member → 404, read-only member → 403. The destination must be in the same organization and must not be archived (409). Moving to the same project → 400.
+- A move keeps the task's ID, title, status and assignee unchanged. The assignee is not re-checked against the destination project's members.
 
 ## Seed data
 
