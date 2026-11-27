@@ -19,6 +19,7 @@ go test ./...
 | GET | `/projects/{pid}/tasks/{tid}` | |
 | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
 | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+| POST | `/projects/{pid}/tasks/{tid}/move` | `{"toProjectId"}` → 200 with the moved task |
 
 Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 
@@ -30,6 +31,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
 - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
 - Only managers may delete tasks.
+- Moving a task requires the `manager` role in its current project. The target project must be in the same organization and the user must have the `contributor` or `manager` role there: no role → 404, `viewer` → 403. An archived target → 409; an archived source → 409. Moving to the task's current project → 400. The task keeps its ID, title, status and assignee.
 - Archived projects reject all writes with 409 (reads still work).
 - A task ID that does not belong to the project in the path → 404.
 
