@@ -18,6 +18,7 @@ go test ./...
 | POST | `/projects/{pid}/tasks` | `{"title","assignee"}` → 201 |
 | GET | `/projects/{pid}/tasks/{tid}` | |
 | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+| PATCH | `/projects/{pid}/tasks/assignee` | `{"taskIds":[...],"assignee"}` → 200 with the updated tasks, in request order; `"assignee":""` unassigns |
 | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
 
 Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
@@ -30,6 +31,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
 - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
 - Only managers may delete tasks.
+- Only managers may change assignees, including in bulk. A bulk assign is all-or-nothing: if any task ID is not in the project (404), the assignee is not a member (400), or the list is empty or has duplicates (400), no task is changed.
 - Archived projects reject all writes with 409 (reads still work).
 - A task ID that does not belong to the project in the path → 404.
 

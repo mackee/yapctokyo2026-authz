@@ -113,6 +113,110 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+func TestBulkAssignAuth(t *testing.T) {
+	cases := []struct {
+		name, user, project, body string
+		want                      int
+	}{
+		{"manager", "ann", "web", `{"taskIds":["t1","t3"],"assignee":"cat"}`, 200},
+		{"manager unassign", "ann", "web", `{"taskIds":["t1"],"assignee":""}`, 200},
+		{"assignee is viewer in ops", "ivy", "ops", `{"taskIds":["t4"],"assignee":"ann"}`, 400},
+		{"contributor", "ben", "web", `{"taskIds":["t1"],"assignee":"cat"}`, 403},
+		{"contributor unassign own", "ben", "web", `{"taskIds":["t1"],"assignee":""}`, 403},
+		{"viewer", "dan", "web", `{"taskIds":["t1"],"assignee":"cat"}`, 403},
+		{"org admin", "eve", "web", `{"taskIds":["t1"],"assignee":"cat"}`, 403},
+		{"non member", "hal", "web", `{"taskIds":["t1"],"assignee":"cat"}`, 404},
+		{"other org", "gus", "web", `{"taskIds":["t1"],"assignee":"cat"}`, 404},
+		{"anonymous", "", "web", `{"taskIds":["t1"],"assignee":"cat"}`, 401},
+		{"unknown user", "zed", "web", `{"taskIds":["t1"],"assignee":"cat"}`, 401},
+		{"archived", "ann", "legacy", `{"taskIds":["t5"],"assignee":"ben"}`, 409},
+		{"task in other project", "ann", "web", `{"taskIds":["t1","t4"],"assignee":"cat"}`, 404},
+		{"unknown task", "ann", "web", `{"taskIds":["t1","t99"],"assignee":"cat"}`, 404},
+		{"assignee is viewer", "ann", "web", `{"taskIds":["t1"],"assignee":"dan"}`, 400},
+		{"assignee not member", "ann", "web", `{"taskIds":["t1"],"assignee":"hal"}`, 400},
+		{"empty task list", "ann", "web", `{"taskIds":[],"assignee":"cat"}`, 400},
+		{"missing task list", "ann", "web", `{"assignee":"cat"}`, 400},
+		{"missing assignee", "ann", "web", `{"taskIds":["t1"]}`, 400},
+		{"null assignee", "ann", "web", `{"taskIds":["t1"],"assignee":null}`, 400},
+		{"duplicate task", "ann", "web", `{"taskIds":["t1","t1"],"assignee":"cat"}`, 400},
+		{"bad json", "ann", "web", `{"taskIds":`, 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := do(t, newServer(), "PATCH", "/projects/"+c.project+"/tasks/assignee", c.user, c.body)
+			if code != c.want {
+				t.Fatalf("got %d want %d", code, c.want)
+			}
+		})
+	}
+}
+
+func TestBulkAssignResponse(t *testing.T) {
+	h := newServer()
+	code, body := do(t, h, "PATCH", "/projects/web/tasks/assignee", "ann", `{"taskIds":["t3","t1"],"assignee":"cat"}`)
+	if code != 200 {
+		t.Fatalf("got %d: %s", code, body)
+	}
+	var tasks []Task
+	if err := json.Unmarshal([]byte(body), &tasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 || tasks[0].ID != "t3" || tasks[1].ID != "t1" {
+		t.Fatalf("want [t3 t1] in request order, got %+v", tasks)
+	}
+	for _, task := range tasks {
+		if task.Assignee != "cat" || task.ProjectID != "web" {
+			t.Fatalf("unexpected task after update: %+v", task)
+		}
+	}
+	// The change is persisted, not just echoed back.
+	_, body = do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
+	if !strings.Contains(body, `"assignee":"cat"`) {
+		t.Fatalf("t1 not persisted: %s", body)
+	}
+}
+
+func TestBulkAssignUnassign(t *testing.T) {
+	h := newServer()
+	code, _ := do(t, h, "PATCH", "/projects/web/tasks/assignee", "ann", `{"taskIds":["t1","t2"],"assignee":""}`)
+	if code != 200 {
+		t.Fatalf("got %d", code)
+	}
+	for _, id := range []string{"t1", "t2"} {
+		_, body := do(t, h, "GET", "/projects/web/tasks/"+id, "ann", "")
+		if !strings.Contains(body, `"assignee":""`) {
+			t.Fatalf("%s still assigned: %s", id, body)
+		}
+	}
+}
+
+func TestBulkAssignAllOrNothing(t *testing.T) {
+	h := newServer()
+	// t4 belongs to ops, so the whole request must fail and t1 must stay as it was.
+	code, _ := do(t, h, "PATCH", "/projects/web/tasks/assignee", "ann", `{"taskIds":["t1","t4"],"assignee":"cat"}`)
+	if code != 404 {
+		t.Fatalf("got %d want 404", code)
+	}
+	code, _ = do(t, h, "PATCH", "/projects/web/tasks/assignee", "ann", `{"taskIds":["t1","t99"],"assignee":"cat"}`)
+	if code != 404 {
+		t.Fatalf("got %d want 404", code)
+	}
+	code, _ = do(t, h, "PATCH", "/projects/web/tasks/assignee", "ann", `{"taskIds":["t1","t3"],"assignee":"hal"}`)
+	if code != 400 {
+		t.Fatalf("got %d want 400", code)
+	}
+	for id, want := range map[string]string{"t1": "ben", "t3": "", "t4": "cat"} {
+		proj := "web"
+		if id == "t4" {
+			proj = "ops"
+		}
+		_, body := do(t, h, "GET", "/projects/"+proj+"/tasks/"+id, "ann", "")
+		if !strings.Contains(body, `"assignee":"`+want+`"`) {
+			t.Fatalf("%s changed, want assignee %q: %s", id, want, body)
+		}
+	}
+}
+
 func TestDelete(t *testing.T) {
 	cases := []struct {
 		name, user, path string

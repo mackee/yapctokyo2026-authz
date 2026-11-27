@@ -40,6 +40,7 @@ func newServer() http.Handler {
 	mux.HandleFunc("GET /projects/{pid}/tasks", s.listTasks)
 	mux.HandleFunc("POST /projects/{pid}/tasks", s.createTask)
 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+	mux.HandleFunc("PATCH /projects/{pid}/tasks/assignee", s.bulkAssignTasks)
 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
 	return mux
@@ -245,6 +246,73 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 		task.Assignee = *req.Assignee
 	}
 	writeJSON(w, 200, task)
+}
+
+type bulkAssignRequest struct {
+	TaskIDs  []string `json:"taskIds"`
+	Assignee *string  `json:"assignee"` // "" unassigns
+}
+
+// bulkAssignTasks changes the assignee of several tasks at once. It is
+// all-or-nothing: every task is validated before any of them is changed.
+func (s *server) bulkAssignTasks(w http.ResponseWriter, r *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	user := s.store.User(r.Header.Get("X-User"))
+	if user == nil {
+		writeError(w, 401, "unauthenticated")
+		return
+	}
+	project := s.store.Project(r.PathValue("pid"))
+	if project == nil || project.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	role := s.store.Role(project.ID, user.ID)
+	if role == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	if role != RoleManager {
+		writeError(w, 403, "only managers may reassign tasks")
+		return
+	}
+	if project.Archived {
+		writeError(w, 409, "project is archived")
+		return
+	}
+	var req bulkAssignRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.TaskIDs) == 0 || req.Assignee == nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if *req.Assignee != "" {
+		assigneeRole := s.store.Role(project.ID, *req.Assignee)
+		if assigneeRole != RoleManager && assigneeRole != RoleContributor {
+			writeError(w, 400, "assignee must be a contributor or manager of the project")
+			return
+		}
+	}
+	seen := make(map[string]bool, len(req.TaskIDs))
+	tasks := make([]*Task, 0, len(req.TaskIDs))
+	for _, id := range req.TaskIDs {
+		if seen[id] {
+			writeError(w, 400, "duplicate task id")
+			return
+		}
+		seen[id] = true
+		task := s.store.Task(id)
+		if task == nil || task.ProjectID != project.ID {
+			writeError(w, 404, "not found")
+			return
+		}
+		tasks = append(tasks, task)
+	}
+	for _, task := range tasks {
+		task.Assignee = *req.Assignee
+	}
+	writeJSON(w, 200, tasks)
 }
 
 func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
