@@ -113,6 +113,77 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+func TestMoveProject(t *testing.T) {
+	cases := []struct {
+		name, user, path, body string
+		want                   int
+	}{
+		{"manager moves and clears assignee", "ivy", "/projects/web/tasks/t1", `{"projectId":"ops","assignee":""}`, 200},
+		{"manager moves, assignee not in target", "ivy", "/projects/web/tasks/t1", `{"projectId":"ops"}`, 400},
+		{"manager moves, assignee valid in target", "ivy", "/projects/web/tasks/t2", `{"projectId":"ops"}`, 200},
+		{"new assignee must be valid in target", "ivy", "/projects/web/tasks/t3", `{"projectId":"ops","assignee":"dan"}`, 400},
+		{"target viewer only", "ann", "/projects/web/tasks/t3", `{"projectId":"ops"}`, 403},
+		{"target not a member", "ben", "/projects/web/tasks/t1", `{"projectId":"ops"}`, 404},
+		{"target other org", "ben", "/projects/web/tasks/t1", `{"projectId":"gx"}`, 404},
+		{"target missing", "ivy", "/projects/web/tasks/t1", `{"projectId":"nope"}`, 404},
+		{"target archived", "ann", "/projects/web/tasks/t1", `{"projectId":"legacy"}`, 409},
+		{"empty projectId", "ivy", "/projects/web/tasks/t1", `{"projectId":""}`, 400},
+		{"contributor cannot move others", "ben", "/projects/web/tasks/t2", `{"projectId":"ops"}`, 403},
+		{"contributor moves own task to project they contribute to", "cat", "/projects/ops/tasks/t4", `{"projectId":"web"}`, 200},
+		{"org admin without source role", "eve", "/projects/web/tasks/t1", `{"projectId":"ops"}`, 403},
+		{"source task in other project", "ivy", "/projects/ops/tasks/t1", `{"projectId":"web"}`, 404},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := do(t, newServer(), "PATCH", c.path, c.user, c.body)
+			if code != c.want {
+				t.Fatalf("got %d want %d", code, c.want)
+			}
+		})
+	}
+}
+
+func TestMoveProjectWithOtherFields(t *testing.T) {
+	srv := newServer()
+	code, body := do(t, srv, "PATCH", "/projects/web/tasks/t2", "ivy",
+		`{"projectId":"ops","title":"Moved footer","status":"done"}`)
+	if code != 200 {
+		t.Fatalf("move: got %d want 200: %s", code, body)
+	}
+	var got Task
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := Task{ID: "t2", ProjectID: "ops", Title: "Moved footer", Status: "done", Assignee: "cat"}
+	if got != want {
+		t.Fatalf("response = %+v, want %+v", got, want)
+	}
+
+	if code, _ := do(t, srv, "GET", "/projects/web/tasks/t2", "ann", ""); code != 404 {
+		t.Fatalf("old project still serves task: got %d", code)
+	}
+	code, body = do(t, srv, "GET", "/projects/ops/tasks/t2", "ivy", "")
+	if code != 200 {
+		t.Fatalf("new project lookup: got %d", code)
+	}
+	json.Unmarshal([]byte(body), &got)
+	if got != want {
+		t.Fatalf("stored task = %+v, want %+v", got, want)
+	}
+}
+
+func TestMoveFailureLeavesTaskUnchanged(t *testing.T) {
+	srv := newServer()
+	// Invalid status alongside a valid move must not partially apply.
+	if code, _ := do(t, srv, "PATCH", "/projects/web/tasks/t2", "ivy", `{"projectId":"ops","status":"nope"}`); code != 400 {
+		t.Fatalf("got %d want 400", code)
+	}
+	code, body := do(t, srv, "GET", "/projects/web/tasks/t2", "ann", "")
+	if code != 200 {
+		t.Fatalf("task moved despite failed request: got %d %s", code, body)
+	}
+}
+
 func TestDelete(t *testing.T) {
 	cases := []struct {
 		name, user, path string

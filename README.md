@@ -17,7 +17,7 @@ go test ./...
 | GET | `/projects/{pid}/tasks` | list tasks of a project |
 | POST | `/projects/{pid}/tasks` | `{"title","assignee"}` → 201 |
 | GET | `/projects/{pid}/tasks/{tid}` | |
-| PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+| PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?,"projectId"?}` → 200 (`projectId` moves the task to another project) |
 | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
 
 Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
@@ -30,6 +30,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
 - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
 - Only managers may delete tasks.
+- Moving a task (`projectId` in PATCH) requires the caller to have write access to the source task as above and the `contributor` or `manager` role in the target project. A missing target, or one in another organization or not readable by the user → 404; readable but not writable → 403; archived target → 409. The task's resulting assignee must be a contributor or manager of the target project, otherwise → 400. Setting `projectId` to the task's current project is allowed.
 - Archived projects reject all writes with 409 (reads still work).
 - A task ID that does not belong to the project in the path → 404.
 

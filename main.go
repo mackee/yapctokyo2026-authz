@@ -168,9 +168,10 @@ func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateRequest struct {
-	Title    *string `json:"title"`
-	Status   *string `json:"status"`
-	Assignee *string `json:"assignee"`
+	Title     *string `json:"title"`
+	Status    *string `json:"status"`
+	Assignee  *string `json:"assignee"`
+	ProjectID *string `json:"projectId"`
 }
 
 func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
@@ -218,6 +219,10 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "title must not be empty")
 		return
 	}
+	if req.ProjectID != nil && *req.ProjectID == "" {
+		writeError(w, 400, "projectId must not be empty")
+		return
+	}
 	if req.Status != nil && !validStatuses[*req.Status] {
 		writeError(w, 400, "invalid status")
 		return
@@ -235,6 +240,40 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Moving a task to another project requires write access there, and the
+	// task's resulting assignee must belong to the target project.
+	var target *Project
+	if req.ProjectID != nil {
+		target = s.store.Project(*req.ProjectID)
+		if target == nil || target.OrgID != user.OrgID {
+			writeError(w, 404, "not found")
+			return
+		}
+		targetRole := s.store.Role(target.ID, user.ID)
+		if targetRole == "" && !user.OrgAdmin {
+			writeError(w, 404, "not found")
+			return
+		}
+		if targetRole != RoleManager && targetRole != RoleContributor {
+			writeError(w, 403, "forbidden in target project")
+			return
+		}
+		if target.Archived {
+			writeError(w, 409, "target project is archived")
+			return
+		}
+		resultAssignee := task.Assignee
+		if req.Assignee != nil {
+			resultAssignee = *req.Assignee
+		}
+		if resultAssignee != "" {
+			assigneeRole := s.store.Role(target.ID, resultAssignee)
+			if assigneeRole != RoleManager && assigneeRole != RoleContributor {
+				writeError(w, 400, "assignee must be a contributor or manager of the target project")
+				return
+			}
+		}
+	}
 	if req.Title != nil {
 		task.Title = *req.Title
 	}
@@ -243,6 +282,9 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Assignee != nil {
 		task.Assignee = *req.Assignee
+	}
+	if target != nil {
+		task.ProjectID = target.ID
 	}
 	writeJSON(w, 200, task)
 }
