@@ -40,6 +40,7 @@ func newServer() http.Handler {
 	mux.HandleFunc("GET /projects/{pid}/tasks", s.listTasks)
 	mux.HandleFunc("POST /projects/{pid}/tasks", s.createTask)
 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+	mux.HandleFunc("PATCH /projects/{pid}/tasks", s.bulkUpdateTaskStatus)
 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
 	return mux
@@ -245,6 +246,81 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 		task.Assignee = *req.Assignee
 	}
 	writeJSON(w, 200, task)
+}
+
+type bulkStatusRequest struct {
+	TaskIDs []string `json:"taskIds"`
+	Status  *string  `json:"status"`
+}
+
+// bulkUpdateTaskStatus sets the status of several tasks in one project.
+// It is all-or-nothing: every task is checked before any is changed.
+func (s *server) bulkUpdateTaskStatus(w http.ResponseWriter, r *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	user := s.store.User(r.Header.Get("X-User"))
+	if user == nil {
+		writeError(w, 401, "unauthenticated")
+		return
+	}
+	project := s.store.Project(r.PathValue("pid"))
+	if project == nil || project.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	role := s.store.Role(project.ID, user.ID)
+	if role == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	if role != RoleManager && role != RoleContributor {
+		writeError(w, 403, "forbidden")
+		return
+	}
+	if project.Archived {
+		writeError(w, 409, "project is archived")
+		return
+	}
+	var req bulkStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if len(req.TaskIDs) == 0 {
+		writeError(w, 400, "taskIds must not be empty")
+		return
+	}
+	if req.Status == nil || !validStatuses[*req.Status] {
+		writeError(w, 400, "invalid status")
+		return
+	}
+
+	// Deduplicate while keeping request order, then validate all tasks
+	// before touching any of them.
+	seen := map[string]bool{}
+	var tasks []*Task
+	for _, id := range req.TaskIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		task := s.store.Task(id)
+		if task == nil || task.ProjectID != project.ID {
+			writeError(w, 404, "task not found: "+id)
+			return
+		}
+		if role == RoleContributor && task.Assignee != user.ID {
+			writeError(w, 403, "contributors may only modify their own tasks")
+			return
+		}
+		tasks = append(tasks, task)
+	}
+
+	for _, task := range tasks {
+		task.Status = *req.Status
+	}
+	writeJSON(w, 200, tasks)
 }
 
 func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {

@@ -17,6 +17,7 @@ go test ./...
 | GET | `/projects/{pid}/tasks` | list tasks of a project |
 | POST | `/projects/{pid}/tasks` | `{"title","assignee"}` → 201 |
 | GET | `/projects/{pid}/tasks/{tid}` | |
+| PATCH | `/projects/{pid}/tasks` | `{"taskIds":[...],"status":"..."}` bulk status change → 200 with the changed tasks; all-or-nothing |
 | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
 | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
 

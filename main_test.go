@@ -132,3 +132,81 @@ func TestDelete(t *testing.T) {
 		})
 	}
 }
+
+func TestBulkStatus(t *testing.T) {
+	cases := []struct {
+		name, user, project, body string
+		want                      int
+	}{
+		{"manager many", "ann", "web", `{"taskIds":["t1","t2"],"status":"done"}`, 200},
+		{"contributor own", "ben", "web", `{"taskIds":["t1"],"status":"done"}`, 200},
+		{"contributor others", "ben", "web", `{"taskIds":["t1","t2"],"status":"done"}`, 403},
+		{"contributor unassigned", "ben", "web", `{"taskIds":["t3"],"status":"done"}`, 403},
+		{"viewer", "dan", "web", `{"taskIds":["t1"],"status":"done"}`, 403},
+		{"org admin", "eve", "web", `{"taskIds":["t1"],"status":"done"}`, 403},
+		{"non member", "hal", "web", `{"taskIds":["t1"],"status":"done"}`, 404},
+		{"other org", "gus", "web", `{"taskIds":["t1"],"status":"done"}`, 404},
+		{"anonymous", "", "web", `{"taskIds":["t1"],"status":"done"}`, 401},
+		{"archived", "ann", "legacy", `{"taskIds":["t5"],"status":"done"}`, 409},
+		{"cross project id", "ann", "web", `{"taskIds":["t1","t4"],"status":"done"}`, 404},
+		{"unknown task id", "ann", "web", `{"taskIds":["t1","zzz"],"status":"done"}`, 404},
+		{"bad status", "ann", "web", `{"taskIds":["t1"],"status":"nope"}`, 400},
+		{"missing status", "ann", "web", `{"taskIds":["t1"]}`, 400},
+		{"empty taskIds", "ann", "web", `{"taskIds":[],"status":"done"}`, 400},
+		{"invalid json", "ann", "web", `{"taskIds":`, 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := do(t, newServer(), "PATCH", "/projects/"+c.project+"/tasks", c.user, c.body)
+			if code != c.want {
+				t.Fatalf("got %d want %d", code, c.want)
+			}
+		})
+	}
+}
+
+func TestBulkStatusResponse(t *testing.T) {
+	code, body := do(t, newServer(), "PATCH", "/projects/web/tasks", "ann",
+		`{"taskIds":["t3","t1","t3"],"status":"done"}`)
+	if code != 200 {
+		t.Fatalf("got %d: %s", code, body)
+	}
+	var tasks []Task
+	if err := json.Unmarshal([]byte(body), &tasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 || tasks[0].ID != "t3" || tasks[1].ID != "t1" {
+		t.Fatalf("unexpected tasks: %+v", tasks)
+	}
+	for _, task := range tasks {
+		if task.Status != "done" {
+			t.Fatalf("task %s status %q", task.ID, task.Status)
+		}
+	}
+}
+
+func TestBulkStatusIsAllOrNothing(t *testing.T) {
+	h := newServer()
+	// t4 belongs to ops, so the whole request must be rejected.
+	if code, _ := do(t, h, "PATCH", "/projects/web/tasks", "ann",
+		`{"taskIds":["t1","t4"],"status":"done"}`); code != 404 {
+		t.Fatalf("got %d want 404", code)
+	}
+	// Contributor ben may change t1 but not t2: nothing should change.
+	if code, _ := do(t, h, "PATCH", "/projects/web/tasks", "ben",
+		`{"taskIds":["t1","t2"],"status":"done"}`); code != 403 {
+		t.Fatalf("got %d want 403", code)
+	}
+	code, body := do(t, h, "GET", "/projects/web/tasks", "ann", "")
+	if code != 200 {
+		t.Fatal(code)
+	}
+	var tasks []Task
+	json.Unmarshal([]byte(body), &tasks)
+	want := map[string]string{"t1": "open", "t2": "doing", "t3": "open"}
+	for _, task := range tasks {
+		if task.Status != want[task.ID] {
+			t.Fatalf("task %s changed to %q", task.ID, task.Status)
+		}
+	}
+}
