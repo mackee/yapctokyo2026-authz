@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"strings"
 )
 
 // Taskboard: a tiny project task tracker.
@@ -22,6 +23,8 @@ import (
 //   - only managers may delete tasks
 //   - archived projects reject all writes                      -> 409
 //   - a task ID that is not in the path project               -> 404
+//   - merge needs manager role in both projects; any task whose assignee
+//     is not a contributor/manager of the target blocks the whole merge -> 409
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -42,6 +45,7 @@ func newServer() http.Handler {
 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
+	mux.HandleFunc("POST /projects/{pid}/merge", s.mergeProject)
 	return mux
 }
 
@@ -281,4 +285,83 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.DeleteTask(task.ID)
 	w.WriteHeader(204)
+}
+
+type mergeRequest struct {
+	IntoProjectID string `json:"intoProjectId"`
+}
+
+// mergeProject moves every task of the path project into intoProjectId.
+// Either all tasks move or none do.
+func (s *server) mergeProject(w http.ResponseWriter, r *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	user := s.store.User(r.Header.Get("X-User"))
+	if user == nil {
+		writeError(w, 401, "unauthenticated")
+		return
+	}
+	src := s.store.Project(r.PathValue("pid"))
+	if src == nil || src.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	srcRole := s.store.Role(src.ID, user.ID)
+	if srcRole == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	var req mergeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IntoProjectID == "" {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.IntoProjectID == src.ID {
+		writeError(w, 400, "cannot merge a project into itself")
+		return
+	}
+	dst := s.store.Project(req.IntoProjectID)
+	if dst == nil || dst.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	dstRole := s.store.Role(dst.ID, user.ID)
+	if dstRole == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	if srcRole != RoleManager || dstRole != RoleManager {
+		writeError(w, 403, "forbidden")
+		return
+	}
+	if src.Archived || dst.Archived {
+		writeError(w, 409, "project is archived")
+		return
+	}
+
+	tasks := s.store.TasksInProject(src.ID)
+	var blocked []string
+	for _, t := range tasks {
+		if t.Assignee == "" {
+			continue
+		}
+		role := s.store.Role(dst.ID, t.Assignee)
+		if role != RoleManager && role != RoleContributor {
+			blocked = append(blocked, t.ID)
+		}
+	}
+	if len(blocked) > 0 {
+		writeError(w, 409, "tasks cannot be moved, assignee is not a contributor or manager of "+
+			dst.ID+": "+strings.Join(blocked, ", "))
+		return
+	}
+
+	if tasks == nil {
+		tasks = []*Task{}
+	}
+	for _, t := range tasks {
+		t.ProjectID = dst.ID
+	}
+	writeJSON(w, 200, tasks)
 }

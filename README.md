@@ -19,6 +19,7 @@ go test ./...
 | GET | `/projects/{pid}/tasks/{tid}` | |
 | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
 | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+| POST | `/projects/{pid}/merge` | `{"intoProjectId"}` → 200 with the moved tasks; 409 if any task cannot move |
 
 Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 
@@ -32,6 +33,9 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Only managers may delete tasks.
 - Archived projects reject all writes with 409 (reads still work).
 - A task ID that does not belong to the project in the path → 404.
+- Merging moves all tasks of the path project into `intoProjectId`. The caller must be a manager of both projects (403 otherwise; 404 if either project is not visible). Either project archived → 409.
+- A task cannot move if its assignee is not a contributor or manager of the target project. If any task is blocked, the merge is refused with 409 (the error names the blocked task IDs) and no task moves. Unassigned tasks always move.
+- Merging a project into itself → 400.
 
 ## Seed data
 

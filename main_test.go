@@ -113,6 +113,124 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+func TestMergeErrors(t *testing.T) {
+	cases := []struct {
+		name, user, path, body string
+		want                   int
+	}{
+		{"anonymous", "", "/projects/ops/merge", `{"intoProjectId":"web"}`, 401},
+		{"unknown user", "zed", "/projects/ops/merge", `{"intoProjectId":"web"}`, 401},
+		{"non member source", "hal", "/projects/web/merge", `{"intoProjectId":"ops"}`, 404},
+		{"other org source", "gus", "/projects/web/merge", `{"intoProjectId":"ops"}`, 404},
+		{"missing source", "ivy", "/projects/nope/merge", `{"intoProjectId":"ops"}`, 404},
+		{"target not visible", "ivy", "/projects/ops/merge", `{"intoProjectId":"legacy"}`, 404},
+		{"target missing", "ivy", "/projects/ops/merge", `{"intoProjectId":"nope"}`, 404},
+		{"target other org", "ivy", "/projects/ops/merge", `{"intoProjectId":"gx"}`, 404},
+		{"viewer source", "ann", "/projects/ops/merge", `{"intoProjectId":"web"}`, 403},
+		{"contributor source", "cat", "/projects/ops/merge", `{"intoProjectId":"web"}`, 403},
+		{"org admin source", "eve", "/projects/ops/merge", `{"intoProjectId":"web"}`, 403},
+		{"viewer target", "ann", "/projects/web/merge", `{"intoProjectId":"ops"}`, 403},
+		{"archived target", "ann", "/projects/web/merge", `{"intoProjectId":"legacy"}`, 409},
+		{"archived source", "ann", "/projects/legacy/merge", `{"intoProjectId":"web"}`, 409},
+		{"into itself", "ivy", "/projects/web/merge", `{"intoProjectId":"web"}`, 400},
+		{"missing target field", "ivy", "/projects/ops/merge", `{}`, 400},
+		{"bad body", "ivy", "/projects/ops/merge", `not json`, 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
+			if code != c.want {
+				t.Fatalf("got %d want %d", code, c.want)
+			}
+		})
+	}
+}
+
+func TestMergeMovesAllTasks(t *testing.T) {
+	srv := newServer()
+	code, body := do(t, srv, "POST", "/projects/ops/merge", "ivy", `{"intoProjectId":"web"}`)
+	if code != 200 {
+		t.Fatalf("got %d: %s", code, body)
+	}
+	var moved []Task
+	if err := json.Unmarshal([]byte(body), &moved); err != nil {
+		t.Fatal(err)
+	}
+	if len(moved) != 1 || moved[0].ID != "t4" || moved[0].ProjectID != "web" {
+		t.Fatalf("unexpected moved tasks: %+v", moved)
+	}
+
+	_, body = do(t, srv, "GET", "/projects/web/tasks", "ivy", "")
+	var web []Task
+	json.Unmarshal([]byte(body), &web)
+	if len(web) != 4 {
+		t.Fatalf("web: want 4 tasks, got %d", len(web))
+	}
+	_, body = do(t, srv, "GET", "/projects/ops/tasks", "ivy", "")
+	var ops []Task
+	json.Unmarshal([]byte(body), &ops)
+	if len(ops) != 0 {
+		t.Fatalf("ops: want 0 tasks, got %d", len(ops))
+	}
+}
+
+func TestMergeEmptySource(t *testing.T) {
+	srv := newServer()
+	if code, body := do(t, srv, "DELETE", "/projects/ops/tasks/t4", "ivy", ""); code != 204 {
+		t.Fatalf("setup delete: got %d: %s", code, body)
+	}
+	code, body := do(t, srv, "POST", "/projects/ops/merge", "ivy", `{"intoProjectId":"web"}`)
+	if code != 200 || body != "[]\n" {
+		t.Fatalf("got %d %q, want 200 []", code, body)
+	}
+}
+
+func TestMergeIsAllOrNothing(t *testing.T) {
+	srv := newServer()
+	// t1 is assigned to ben, who has no role in ops, so the whole merge must fail.
+	code, body := do(t, srv, "POST", "/projects/web/merge", "ivy", `{"intoProjectId":"ops"}`)
+	if code != 409 {
+		t.Fatalf("got %d: %s", code, body)
+	}
+	if !strings.Contains(body, "t1") || strings.Contains(body, "t2") {
+		t.Fatalf("error should name only the blocked task t1: %s", body)
+	}
+
+	_, body = do(t, srv, "GET", "/projects/web/tasks", "ivy", "")
+	var web []Task
+	json.Unmarshal([]byte(body), &web)
+	if len(web) != 3 {
+		t.Fatalf("web: want 3 tasks after failed merge, got %d", len(web))
+	}
+	for _, task := range web {
+		if task.ProjectID != "web" {
+			t.Fatalf("task %s moved despite failed merge", task.ID)
+		}
+	}
+}
+
+func TestMergeAfterBlockedTaskRemoved(t *testing.T) {
+	srv := newServer()
+	if code, body := do(t, srv, "DELETE", "/projects/web/tasks/t1", "ivy", ""); code != 204 {
+		t.Fatalf("setup delete: got %d: %s", code, body)
+	}
+	// Remaining web tasks: t2 (cat, contributor in ops) and t3 (unassigned).
+	code, body := do(t, srv, "POST", "/projects/web/merge", "ivy", `{"intoProjectId":"ops"}`)
+	if code != 200 {
+		t.Fatalf("got %d: %s", code, body)
+	}
+	var moved []Task
+	json.Unmarshal([]byte(body), &moved)
+	if len(moved) != 2 || moved[0].ID != "t2" || moved[1].ID != "t3" {
+		t.Fatalf("unexpected moved tasks: %+v", moved)
+	}
+	for _, task := range moved {
+		if task.ProjectID != "ops" {
+			t.Fatalf("task %s not in ops: %s", task.ID, task.ProjectID)
+		}
+	}
+}
+
 func TestDelete(t *testing.T) {
 	cases := []struct {
 		name, user, path string
