@@ -113,6 +113,81 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+func TestMove(t *testing.T) {
+	cases := []struct {
+		name, user, path, body string
+		want                   int
+	}{
+		{"manager to writable project", "ivy", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 200},
+		{"manager to viewer-only project", "ann", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 403},
+		{"contributor", "ben", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 403},
+		{"viewer", "dan", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 403},
+		{"org admin", "eve", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 403},
+		{"non member", "hal", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 404},
+		{"other org", "gus", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 404},
+		{"anonymous", "", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 401},
+		{"cross project id", "ivy", "/projects/web/tasks/t4", `{"toProjectId":"ops"}`, 404},
+		{"unknown destination", "ivy", "/projects/web/tasks/t1", `{"toProjectId":"nope"}`, 404},
+		{"destination other org", "ivy", "/projects/web/tasks/t1", `{"toProjectId":"gx"}`, 404},
+		{"destination archived", "ann", "/projects/web/tasks/t1", `{"toProjectId":"legacy"}`, 409},
+		{"source archived", "ann", "/projects/legacy/tasks/t5", `{"toProjectId":"web"}`, 409},
+		{"same project", "ivy", "/projects/web/tasks/t1", `{"toProjectId":"web"}`, 400},
+		{"empty destination", "ivy", "/projects/web/tasks/t1", `{"toProjectId":""}`, 400},
+		{"bad body", "ivy", "/projects/web/tasks/t1", `not json`, 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := do(t, newServer(), "POST", c.path+"/move", c.user, c.body)
+			if code != c.want {
+				t.Fatalf("got %d want %d", code, c.want)
+			}
+		})
+	}
+}
+
+func TestMovePreservesTaskAndChangesProject(t *testing.T) {
+	h := newServer()
+
+	code, body := do(t, h, "POST", "/projects/web/tasks/t2/move", "ivy", `{"toProjectId":"ops"}`)
+	if code != 200 {
+		t.Fatalf("move: got %d body %s", code, body)
+	}
+	var moved Task
+	if err := json.Unmarshal([]byte(body), &moved); err != nil {
+		t.Fatal(err)
+	}
+	want := Task{ID: "t2", ProjectID: "ops", Title: "Update footer", Status: "doing", Assignee: "cat"}
+	if moved != want {
+		t.Fatalf("moved task = %+v, want %+v", moved, want)
+	}
+
+	code, body = do(t, h, "GET", "/projects/ops/tasks/t2", "ivy", "")
+	if code != 200 {
+		t.Fatalf("get in new project: got %d body %s", code, body)
+	}
+	var got Task
+	json.Unmarshal([]byte(body), &got)
+	if got != want {
+		t.Fatalf("stored task = %+v, want %+v", got, want)
+	}
+
+	if code, _ := do(t, h, "GET", "/projects/web/tasks/t2", "ivy", ""); code != 404 {
+		t.Fatalf("get in old project: got %d want 404", code)
+	}
+
+	code, body = do(t, h, "GET", "/projects/web/tasks", "ivy", "")
+	if code != 200 {
+		t.Fatal(code)
+	}
+	var webTasks []Task
+	json.Unmarshal([]byte(body), &webTasks)
+	for _, task := range webTasks {
+		if task.ID == "t2" {
+			t.Fatal("moved task still listed in source project")
+		}
+	}
+}
+
 func TestDelete(t *testing.T) {
 	cases := []struct {
 		name, user, path string
