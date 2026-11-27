@@ -15,6 +15,7 @@ import (
 //   - unknown or missing user                                  -> 401
 //   - project missing, in another org, or not readable by user -> 404
 //   - a project is readable by its members (any role) and by org admins of its org
+//   - org admins act as managers in every project of their org
 //   - writes need contributor or manager role in the project;
 //     readable-but-not-allowed                                 -> 403
 //   - contributors may only modify tasks assigned to themselves
@@ -69,8 +70,8 @@ func (s *server) listTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
-	if role == "" && !user.OrgAdmin {
+	role := s.store.EffectiveRole(project, user)
+	if role == "" {
 		writeError(w, 404, "not found")
 		return
 	}
@@ -95,8 +96,8 @@ func (s *server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
-	if role == "" && !user.OrgAdmin {
+	role := s.store.EffectiveRole(project, user)
+	if role == "" {
 		writeError(w, 404, "not found")
 		return
 	}
@@ -127,8 +128,8 @@ func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
-	if role == "" && !user.OrgAdmin {
+	role := s.store.EffectiveRole(project, user)
+	if role == "" {
 		writeError(w, 404, "not found")
 		return
 	}
@@ -187,8 +188,8 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
-	if role == "" && !user.OrgAdmin {
+	role := s.store.EffectiveRole(project, user)
+	if role == "" {
 		writeError(w, 404, "not found")
 		return
 	}
@@ -261,8 +262,8 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
-	if role == "" && !user.OrgAdmin {
+	role := s.store.EffectiveRole(project, user)
+	if role == "" {
 		writeError(w, 404, "not found")
 		return
 	}

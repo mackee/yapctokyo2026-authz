@@ -9,7 +9,7 @@ import (
 type User struct {
 	ID       string
 	OrgID    string
-	OrgAdmin bool // org admins may read every project in their org, but cannot write
+	OrgAdmin bool // org admins may read every project in their org and act as its manager
 }
 
 type Project struct {
@@ -50,6 +50,17 @@ func (s *Store) User(id string) *User { return s.users[id] }
 func (s *Store) Project(id string) *Project { return s.projects[id] }
 
 func (s *Store) Role(projectID, userID string) string { return s.members[projectID][userID] }
+
+// EffectiveRole is the role user acts with in project. Org admins act as
+// managers in every project of their organization, whether or not they are
+// members. It returns "" when the user has no access to the project.
+// Callers must check that the project belongs to the user's organization.
+func (s *Store) EffectiveRole(project *Project, user *User) string {
+	if user.OrgAdmin {
+		return RoleManager
+	}
+	return s.Role(project.ID, user.ID)
+}
 
 func (s *Store) Task(id string) *Task { return s.tasks[id] }
 
