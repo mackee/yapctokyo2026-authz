@@ -12,6 +12,8 @@
 
 元の実行環境は、Apple silicon の macOS、Go 1.27.4（`/opt/homebrew/bin/go`。fixture の宣言は `go 1.26`）、Claude Code 2.1.332、herdr 0.9.5、Quint 0.33.1。
 
+ハーネスはモデルをエイリアス（`--model haiku` / `--model sonnet`）で渡しており、エイリアスが指すモデルは後で新しいものに変わりうる。元の実行（2026-11-21〜2026-11-26）では、それぞれ `claude-haiku-5-5` と `claude-sonnet-5-5` だった。同じモデルで回すには、`MODEL=claude-haiku-5-5` のように `MODEL` に完全な ID を指定する。
+
 ## 1. 表を計算し直す
 
 `scripts/summarize-verdicts.py` は、判定ファイルの組ごとに、タスク別の authz_ok / func_ok / 拒否しすぎを出す。どの判定を並べるかは、`results/*-manifest.tsv` と各レポートを見て選ぶ。TOTAL の行は中心の7タスクの合計である（凍結と、`replication-verdicts` に入っている単発のタスクは含めない）。

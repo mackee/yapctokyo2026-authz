@@ -13,6 +13,11 @@ There are three levels. Each one needs more setup than the one before.
 The original runs used macOS on Apple silicon, Go 1.27.4 (`/opt/homebrew/bin/go`; the
 fixtures declare `go 1.26`), Claude Code 2.1.332, herdr 0.9.5 and Quint 0.33.1.
 
+The harness passes model aliases (`--model haiku` / `--model sonnet`), and an alias may
+point to a newer model later. In the original runs (2026-11-21 to 2026-11-26) they
+resolved to `claude-haiku-5-5` and `claude-sonnet-5-5`. To run the same models, set
+`MODEL` to the full ID, e.g. `MODEL=claude-haiku-5-5`.
+
 ## 1. Recompute the tables
 
 `scripts/summarize-verdicts.py` prints authz_ok / func_ok / over-denial per task for

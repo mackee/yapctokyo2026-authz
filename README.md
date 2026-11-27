@@ -131,3 +131,8 @@ What the reports took from them is published as derived tables:
 - `results/invtest-rulecheck-hits.tsv`: per-trial count of `go test` runs, and of runs where the invariant check failed, from the transcripts.
 
 The other statements in the reports that were counted from transcripts say so.
+
+## License
+
+Code is under the MIT License; documentation and data (reports, tasks, results) are under
+CC BY 4.0. Vendored third-party code keeps its own license. See [LICENSE](LICENSE).
