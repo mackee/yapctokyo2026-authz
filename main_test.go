@@ -113,6 +113,71 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+func TestMove(t *testing.T) {
+	cases := []struct {
+		name, user, path, body string
+		want                   int
+	}{
+		{"manager of both", "ivy", "/projects/web/tasks/t2/move", `{"toProjectId":"ops"}`, 200},
+		{"contributor own", "ben", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
+		{"viewer source", "dan", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
+		{"org admin", "eve", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
+		{"non member", "hal", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 404},
+		{"other org", "gus", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 404},
+		{"unknown user", "zed", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 401},
+		{"anonymous", "", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 401},
+		{"cross project id", "ann", "/projects/web/tasks/t4/move", `{"toProjectId":"ops"}`, 404},
+		{"missing target", "ann", "/projects/web/tasks/t1/move", `{}`, 400},
+		{"bad json", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":`, 400},
+		{"unknown target", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"nope"}`, 404},
+		{"target other org", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"gx"}`, 404},
+		{"target viewer only", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
+		{"target archived", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"legacy"}`, 409},
+		{"source archived", "ann", "/projects/legacy/tasks/t5/move", `{"toProjectId":"web"}`, 409},
+		{"same project", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"web"}`, 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
+			if code != c.want {
+				t.Fatalf("got %d want %d", code, c.want)
+			}
+		})
+	}
+}
+
+func TestMoveKeepsFieldsAndLocation(t *testing.T) {
+	srv := newServer()
+	code, body := do(t, srv, "POST", "/projects/web/tasks/t2/move", "ivy", `{"toProjectId":"ops"}`)
+	if code != 200 {
+		t.Fatalf("move: got %d: %s", code, body)
+	}
+	var moved Task
+	if err := json.Unmarshal([]byte(body), &moved); err != nil {
+		t.Fatal(err)
+	}
+	want := Task{ID: "t2", ProjectID: "ops", Title: "Update footer", Status: "doing", Assignee: "cat"}
+	if moved != want {
+		t.Fatalf("moved task = %+v, want %+v", moved, want)
+	}
+
+	// Readable from the target project, and gone from the source project.
+	code, body = do(t, srv, "GET", "/projects/ops/tasks/t2", "cat", "")
+	if code != 200 {
+		t.Fatalf("get in target: got %d: %s", code, body)
+	}
+	code, _ = do(t, srv, "GET", "/projects/web/tasks/t2", "ann", "")
+	if code != 404 {
+		t.Fatalf("get in source: got %d want 404", code)
+	}
+	code, body = do(t, srv, "GET", "/projects/web/tasks", "ann", "")
+	var webTasks []Task
+	json.Unmarshal([]byte(body), &webTasks)
+	if code != 200 || len(webTasks) != 2 {
+		t.Fatalf("web list: got %d with %d tasks, want 200 with 2", code, len(webTasks))
+	}
+}
+
 func TestDelete(t *testing.T) {
 	cases := []struct {
 		name, user, path string
