@@ -113,6 +113,110 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+func TestCopy(t *testing.T) {
+	cases := []struct {
+		name, user, path, body string
+		want                   int
+	}{
+		{"manager copies", "ivy", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 201},
+		{"contributor copies own", "cat", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 201},
+		{"unassigned copies", "ivy", "/projects/web/tasks/t3", `{"toProjectId":"ops"}`, 201},
+		{"assignee not in target", "ivy", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 400},
+		{"contributor copies task of non-target member", "cat", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 400},
+		{"viewer in target", "ann", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 403},
+		{"org admin in target", "eve", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 403},
+		{"non member source", "hal", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 404},
+		{"other org source", "gus", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 404},
+		{"other org target", "ann", "/projects/web/tasks/t3", `{"toProjectId":"gx"}`, 404},
+		{"unknown target", "ivy", "/projects/web/tasks/t3", `{"toProjectId":"nope"}`, 404},
+		{"archived target", "ann", "/projects/web/tasks/t3", `{"toProjectId":"legacy"}`, 409},
+		{"same project", "ivy", "/projects/web/tasks/t3", `{"toProjectId":"web"}`, 400},
+		{"missing toProjectId", "ivy", "/projects/web/tasks/t3", `{}`, 400},
+		{"invalid body", "ivy", "/projects/web/tasks/t3", `nope`, 400},
+		{"task in other project", "ann", "/projects/web/tasks/t4", `{"toProjectId":"ops"}`, 404},
+		{"anonymous", "", "/projects/web/tasks/t3", `{"toProjectId":"ops"}`, 401},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := do(t, newServer(), "POST", c.path+"/copy", c.user, c.body)
+			if code != c.want {
+				t.Fatalf("got %d want %d", code, c.want)
+			}
+		})
+	}
+}
+
+func TestCopyContributorCannotCopyUnassignableTask(t *testing.T) {
+	srv := newServer()
+	// ivy (manager in web and ops) is assigned a task in web.
+	code, body := do(t, srv, "POST", "/projects/web/tasks", "ann", `{"title":"for ivy","assignee":"ivy"}`)
+	if code != 201 {
+		t.Fatalf("setup: got %d %s", code, body)
+	}
+	var created Task
+	json.Unmarshal([]byte(body), &created)
+
+	// cat is a contributor in ops; copying a task assigned to ivy would
+	// assign it to someone else, which contributors may not do.
+	code, _ = do(t, srv, "POST", "/projects/web/tasks/"+created.ID+"/copy", "cat", `{"toProjectId":"ops"}`)
+	if code != 403 {
+		t.Fatalf("contributor copy to other assignee: got %d want 403", code)
+	}
+	code, _ = do(t, srv, "POST", "/projects/web/tasks/"+created.ID+"/copy", "ivy", `{"toProjectId":"ops"}`)
+	if code != 201 {
+		t.Fatalf("manager copy: got %d want 201", code)
+	}
+}
+
+func TestCopyCreatesNewOpenTaskAndKeepsSource(t *testing.T) {
+	srv := newServer()
+	code, body := do(t, srv, "POST", "/projects/web/tasks/t2/copy", "ivy", `{"toProjectId":"ops"}`)
+	if code != 201 {
+		t.Fatalf("got %d %s", code, body)
+	}
+	var copied Task
+	if err := json.Unmarshal([]byte(body), &copied); err != nil {
+		t.Fatal(err)
+	}
+	if copied.ID == "" || copied.ID == "t2" {
+		t.Fatalf("want a new ID, got %q", copied.ID)
+	}
+	if copied.ProjectID != "ops" {
+		t.Fatalf("projectId = %q want ops", copied.ProjectID)
+	}
+	if copied.Title != "Update footer" {
+		t.Fatalf("title = %q", copied.Title)
+	}
+	if copied.Assignee != "cat" {
+		t.Fatalf("assignee = %q want cat", copied.Assignee)
+	}
+	if copied.Status != "open" {
+		t.Fatalf("status = %q want open (source is doing)", copied.Status)
+	}
+
+	// The copy is visible in the target project.
+	if code, _ := do(t, srv, "GET", "/projects/ops/tasks/"+copied.ID, "ivy", ""); code != 200 {
+		t.Fatalf("copy not readable in target: %d", code)
+	}
+	// The source is unchanged.
+	code, body = do(t, srv, "GET", "/projects/web/tasks/t2", "ivy", "")
+	if code != 200 {
+		t.Fatalf("source get: %d", code)
+	}
+	var src Task
+	json.Unmarshal([]byte(body), &src)
+	if src.ProjectID != "web" || src.Status != "doing" || src.Assignee != "cat" || src.Title != "Update footer" {
+		t.Fatalf("source changed: %+v", src)
+	}
+	// Target now has its seeded task plus the copy.
+	code, body = do(t, srv, "GET", "/projects/ops/tasks", "ivy", "")
+	var tasks []Task
+	json.Unmarshal([]byte(body), &tasks)
+	if code != 200 || len(tasks) != 2 {
+		t.Fatalf("ops tasks: code %d, got %d", code, len(tasks))
+	}
+}
+
 func TestDelete(t *testing.T) {
 	cases := []struct {
 		name, user, path string

@@ -22,6 +22,8 @@ import (
 //   - only managers may delete tasks
 //   - archived projects reject all writes                      -> 409
 //   - a task ID that is not in the path project               -> 404
+//   - copying a task is a read of the source plus a create in the target
+//     project, so the create rules apply to the target              (see copyTask)
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -42,6 +44,7 @@ func newServer() http.Handler {
 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
+	mux.HandleFunc("POST /projects/{pid}/tasks/{tid}/copy", s.copyTask)
 	return mux
 }
 
@@ -281,4 +284,84 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.DeleteTask(task.ID)
 	w.WriteHeader(204)
+}
+
+type copyRequest struct {
+	ToProjectID string `json:"toProjectId"`
+}
+
+// copyTask creates a new open task in another project, carrying over the
+// title and assignee of the source task. The source task is left unchanged.
+func (s *server) copyTask(w http.ResponseWriter, r *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	user := s.store.User(r.Header.Get("X-User"))
+	if user == nil {
+		writeError(w, 401, "unauthenticated")
+		return
+	}
+	project := s.store.Project(r.PathValue("pid"))
+	if project == nil || project.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	role := s.store.Role(project.ID, user.ID)
+	if role == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	task := s.store.Task(r.PathValue("tid"))
+	if task == nil || task.ProjectID != project.ID {
+		writeError(w, 404, "not found")
+		return
+	}
+	var req copyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if req.ToProjectID == project.ID {
+		writeError(w, 400, "toProjectId must differ from the source project")
+		return
+	}
+	// The target project is checked with the same rules as createTask.
+	target := s.store.Project(req.ToProjectID)
+	if target == nil || target.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	targetRole := s.store.Role(target.ID, user.ID)
+	if targetRole == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	if targetRole != RoleManager && targetRole != RoleContributor {
+		writeError(w, 403, "forbidden")
+		return
+	}
+	if target.Archived {
+		writeError(w, 409, "project is archived")
+		return
+	}
+	if task.Assignee != "" {
+		assigneeRole := s.store.Role(target.ID, task.Assignee)
+		if assigneeRole != RoleManager && assigneeRole != RoleContributor {
+			writeError(w, 400, "assignee must be a contributor or manager of the target project")
+			return
+		}
+		if targetRole == RoleContributor && task.Assignee != user.ID {
+			writeError(w, 403, "contributors may only assign tasks to themselves")
+			return
+		}
+	}
+	copied := &Task{
+		ID:        s.store.NewTaskID(),
+		ProjectID: target.ID,
+		Title:     task.Title,
+		Status:    "open",
+		Assignee:  task.Assignee,
+	}
+	s.store.PutTask(copied)
+	writeJSON(w, 201, copied)
 }

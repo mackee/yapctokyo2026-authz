@@ -19,6 +19,7 @@ go test ./...
 | GET | `/projects/{pid}/tasks/{tid}` | |
 | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
 | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+| POST | `/projects/{pid}/tasks/{tid}/copy` | `{"toProjectId"}` → 201; copies title and assignee into a new `open` task in the target project; the source is unchanged |
 
 Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 
@@ -32,6 +33,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Only managers may delete tasks.
 - Archived projects reject all writes with 409 (reads still work).
 - A task ID that does not belong to the project in the path → 404.
+- Copying a task requires read access to the source (as above) and the same write rules as creating a task in the target project: the target must be readable (else 404), the user must be a `contributor` or `manager` there (else 403), and an archived target → 409. The copied assignee must be a contributor or manager of the target (else 400), and a contributor may only copy a task whose assignee is themselves (else 403). `toProjectId` must differ from the source project (400).
 
 ## Seed data
 
