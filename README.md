@@ -14,6 +14,7 @@ go test ./...
 
 | Method | Path | Notes |
 | --- | --- | --- |
+| GET | `/me/tasks` | tasks assigned to the caller across all readable projects; optional `?status=open\|doing\|done` (unknown status → 400) |
 | GET | `/projects/{pid}/tasks` | list tasks of a project |
 | POST | `/projects/{pid}/tasks` | `{"title","assignee"}` → 201 |
 | GET | `/projects/{pid}/tasks/{tid}` | |
@@ -32,6 +33,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Only managers may delete tasks.
 - Archived projects reject all writes with 409 (reads still work).
 - A task ID that does not belong to the project in the path → 404.
+- `/me/tasks` returns only tasks assigned to the caller whose project the caller can read (same rules as above). Results are ordered by project ID, then task ID. Each task includes `projectId`.
 
 ## Seed data
 

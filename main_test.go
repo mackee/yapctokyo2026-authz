@@ -61,6 +61,97 @@ func TestListOnlyProjectTasks(t *testing.T) {
 	}
 }
 
+func taskIDs(t *testing.T, body string) []string {
+	t.Helper()
+	var tasks []Task
+	if err := json.Unmarshal([]byte(body), &tasks); err != nil {
+		t.Fatalf("decode %q: %v", body, err)
+	}
+	ids := []string{}
+	for _, task := range tasks {
+		if task.ProjectID == "" {
+			t.Fatalf("task %s has no projectId", task.ID)
+		}
+		ids = append(ids, task.ID)
+	}
+	return ids
+}
+
+func TestMyTasks(t *testing.T) {
+	cases := []struct {
+		name, user, path string
+		wantCode         int
+		wantIDs          []string // nil skips the ID check
+	}{
+		// ordered by projectId, then task ID: legacy < ops < web
+		{"assigned across projects", "ben", "/me/tasks", 200, []string{"t5", "t1"}},
+		{"assigned in two projects", "cat", "/me/tasks", 200, []string{"t4", "t2"}},
+		{"cross org assignee", "gus", "/me/tasks", 200, []string{"t6"}},
+		{"no assignments", "ann", "/me/tasks", 200, []string{}},
+		{"org admin without assignments", "eve", "/me/tasks", 200, []string{}},
+		{"no roles", "hal", "/me/tasks", 200, []string{}},
+		{"status open", "ben", "/me/tasks?status=open", 200, []string{"t5", "t1"}},
+		{"status doing", "cat", "/me/tasks?status=doing", 200, []string{"t2"}},
+		{"status filter empty", "cat", "/me/tasks?status=done", 200, []string{}},
+		{"empty status means no filter", "cat", "/me/tasks?status=", 200, []string{"t4", "t2"}},
+		{"invalid status", "ben", "/me/tasks?status=nope", 400, nil},
+		{"anonymous", "", "/me/tasks", 401, nil},
+		{"unknown user", "zed", "/me/tasks", 401, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, body := do(t, newServer(), "GET", c.path, c.user, "")
+			if code != c.wantCode {
+				t.Fatalf("got %d want %d: %s", code, c.wantCode, body)
+			}
+			if c.wantIDs != nil {
+				got := taskIDs(t, body)
+				if strings.Join(got, ",") != strings.Join(c.wantIDs, ",") {
+					t.Fatalf("got ids %v want %v", got, c.wantIDs)
+				}
+			}
+		})
+	}
+}
+
+func TestMyTasksAccess(t *testing.T) {
+	t.Run("non member assignee is excluded", func(t *testing.T) {
+		st := newSeededStore()
+		delete(st.members["web"], "ben")
+		code, body := do(t, newHandler(st), "GET", "/me/tasks", "ben", "")
+		if code != 200 {
+			t.Fatal(code)
+		}
+		if got := taskIDs(t, body); strings.Join(got, ",") != "t5" {
+			t.Fatalf("got %v want [t5]", got)
+		}
+	})
+
+	t.Run("org admin sees assigned tasks in any project of its org", func(t *testing.T) {
+		st := newSeededStore()
+		st.tasks["t3"].Assignee = "eve" // eve is an org admin with no project roles
+		code, body := do(t, newHandler(st), "GET", "/me/tasks", "eve", "")
+		if code != 200 {
+			t.Fatal(code)
+		}
+		if got := taskIDs(t, body); strings.Join(got, ",") != "t3" {
+			t.Fatalf("got %v want [t3]", got)
+		}
+	})
+
+	t.Run("task in another org's project is excluded", func(t *testing.T) {
+		st := newSeededStore()
+		st.tasks["t3"].Assignee = "gus" // gus is in globex; web belongs to acme
+		code, body := do(t, newHandler(st), "GET", "/me/tasks", "gus", "")
+		if code != 200 {
+			t.Fatal(code)
+		}
+		if got := taskIDs(t, body); strings.Join(got, ",") != "t6" {
+			t.Fatalf("got %v want [t6]", got)
+		}
+	})
+}
+
 func TestCreate(t *testing.T) {
 	cases := []struct {
 		name, user, project, body string

@@ -22,6 +22,9 @@ import (
 //   - only managers may delete tasks
 //   - archived projects reject all writes                      -> 409
 //   - a task ID that is not in the path project               -> 404
+//   - GET /me/tasks lists the caller's assigned tasks across projects,
+//     limited to projects the caller can read; ?status= filters them
+//     (unknown status                                          -> 400)
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -35,8 +38,13 @@ type server struct {
 }
 
 func newServer() http.Handler {
-	s := &server{store: newSeededStore()}
+	return newHandler(newSeededStore())
+}
+
+func newHandler(st *Store) http.Handler {
+	s := &server{store: st}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /me/tasks", s.myTasks)
 	mux.HandleFunc("GET /projects/{pid}/tasks", s.listTasks)
 	mux.HandleFunc("POST /projects/{pid}/tasks", s.createTask)
 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
@@ -77,6 +85,39 @@ func (s *server) listTasks(w http.ResponseWriter, r *http.Request) {
 	tasks := s.store.TasksInProject(project.ID)
 	if tasks == nil {
 		tasks = []*Task{}
+	}
+	writeJSON(w, 200, tasks)
+}
+
+// myTasks lists tasks assigned to the caller across all projects the caller
+// can read. Optional ?status= narrows the result to one status.
+func (s *server) myTasks(w http.ResponseWriter, r *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	user := s.store.User(r.Header.Get("X-User"))
+	if user == nil {
+		writeError(w, 401, "unauthenticated")
+		return
+	}
+	status := r.URL.Query().Get("status")
+	if status != "" && !validStatuses[status] {
+		writeError(w, 400, "invalid status")
+		return
+	}
+	tasks := []*Task{}
+	for _, task := range s.store.TasksAssignedTo(user.ID) {
+		project := s.store.Project(task.ProjectID)
+		if project == nil || project.OrgID != user.OrgID {
+			continue
+		}
+		if s.store.Role(project.ID, user.ID) == "" && !user.OrgAdmin {
+			continue
+		}
+		if status != "" && task.Status != status {
+			continue
+		}
+		tasks = append(tasks, task)
 	}
 	writeJSON(w, 200, tasks)
 }

@@ -64,6 +64,24 @@ func (s *Store) TasksInProject(projectID string) []*Task {
 	return out
 }
 
+// TasksAssignedTo returns tasks across all projects whose assignee is userID,
+// ordered by project ID and then task ID. It does not check access.
+func (s *Store) TasksAssignedTo(userID string) []*Task {
+	var out []*Task
+	for _, t := range s.tasks {
+		if t.Assignee == userID {
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ProjectID != out[j].ProjectID {
+			return out[i].ProjectID < out[j].ProjectID
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
 func (s *Store) NewTaskID() string {
 	s.nextID++
 	return fmt.Sprintf("t%d", s.nextID)
