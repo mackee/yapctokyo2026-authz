@@ -20,6 +20,9 @@ import (
 //   - contributors may only modify tasks assigned to themselves
 //     and may not reassign tasks; managers may modify any task
 //   - only managers may delete tasks
+//   - moving a task requires write access to both the source project
+//     (contributors only for their own tasks) and the destination project
+//     (contributor or manager there); the task keeps its ID, title, status and assignee
 //   - archived projects reject all writes                      -> 409
 //   - a task ID that is not in the path project               -> 404
 
@@ -35,13 +38,18 @@ type server struct {
 }
 
 func newServer() http.Handler {
-	s := &server{store: newSeededStore()}
+	return newServerWithStore(newSeededStore())
+}
+
+func newServerWithStore(st *Store) http.Handler {
+	s := &server{store: st}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /projects/{pid}/tasks", s.listTasks)
 	mux.HandleFunc("POST /projects/{pid}/tasks", s.createTask)
 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
+	mux.HandleFunc("POST /projects/{pid}/tasks/{tid}/move", s.moveTask)
 	return mux
 }
 
@@ -281,4 +289,76 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
 	}
 	s.store.DeleteTask(task.ID)
 	w.WriteHeader(204)
+}
+
+type moveRequest struct {
+	ToProjectID string `json:"toProjectId"`
+}
+
+func (s *server) moveTask(w http.ResponseWriter, r *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	user := s.store.User(r.Header.Get("X-User"))
+	if user == nil {
+		writeError(w, 401, "unauthenticated")
+		return
+	}
+	project := s.store.Project(r.PathValue("pid"))
+	if project == nil || project.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	role := s.store.Role(project.ID, user.ID)
+	if role == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	task := s.store.Task(r.PathValue("tid"))
+	if task == nil || task.ProjectID != project.ID {
+		writeError(w, 404, "not found")
+		return
+	}
+	if role != RoleManager && role != RoleContributor {
+		writeError(w, 403, "forbidden")
+		return
+	}
+	if role == RoleContributor && task.Assignee != user.ID {
+		writeError(w, 403, "contributors may only move their own tasks")
+		return
+	}
+	if project.Archived {
+		writeError(w, 409, "project is archived")
+		return
+	}
+	var req moveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	target := s.store.Project(req.ToProjectID)
+	if target == nil || target.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	targetRole := s.store.Role(target.ID, user.ID)
+	if targetRole == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	if targetRole != RoleManager && targetRole != RoleContributor {
+		writeError(w, 403, "forbidden")
+		return
+	}
+	if target.Archived {
+		writeError(w, 409, "project is archived")
+		return
+	}
+	if target.ID == project.ID {
+		writeError(w, 400, "task is already in that project")
+		return
+	}
+	// The task keeps its ID, title, status and assignee; only its project changes.
+	task.ProjectID = target.ID
+	writeJSON(w, 200, task)
 }
