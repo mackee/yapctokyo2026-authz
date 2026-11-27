@@ -113,6 +113,81 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+func TestSetMemberRole(t *testing.T) {
+	cases := []struct {
+		name, user, path, body string
+		want                   int
+	}{
+		{"manager changes", "ann", "/projects/web/members/ben", `{"role":"viewer"}`, 200},
+		{"manager promotes viewer", "ann", "/projects/web/members/dan", `{"role":"manager"}`, 200},
+		{"contributor caller", "ben", "/projects/web/members/cat", `{"role":"viewer"}`, 403},
+		{"viewer caller", "dan", "/projects/web/members/ben", `{"role":"viewer"}`, 403},
+		{"org admin caller", "eve", "/projects/web/members/ben", `{"role":"viewer"}`, 403},
+		{"non member caller", "hal", "/projects/web/members/ben", `{"role":"viewer"}`, 404},
+		{"other org caller", "gus", "/projects/web/members/ben", `{"role":"viewer"}`, 404},
+		{"anonymous", "", "/projects/web/members/ben", `{"role":"viewer"}`, 401},
+		{"unknown project", "ann", "/projects/nope/members/ben", `{"role":"viewer"}`, 404},
+		{"project in other org", "ann", "/projects/gx/members/gus", `{"role":"viewer"}`, 404},
+		{"archived", "ann", "/projects/legacy/members/ben", `{"role":"viewer"}`, 409},
+		{"target not a member", "ann", "/projects/web/members/hal", `{"role":"viewer"}`, 404},
+		{"target unknown", "ann", "/projects/web/members/zed", `{"role":"viewer"}`, 404},
+		{"invalid role", "ann", "/projects/web/members/ben", `{"role":"admin"}`, 400},
+		{"empty role", "ann", "/projects/web/members/ben", `{"role":""}`, 400},
+		{"bad body", "ann", "/projects/web/members/ben", `{"role":`, 400},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := do(t, newServer(), "PUT", c.path, c.user, c.body)
+			if code != c.want {
+				t.Fatalf("got %d want %d", code, c.want)
+			}
+		})
+	}
+}
+
+func TestSetMemberRoleResponse(t *testing.T) {
+	code, body := do(t, newServer(), "PUT", "/projects/web/members/ben", "ann", `{"role":"viewer"}`)
+	if code != 200 {
+		t.Fatalf("got %d want 200", code)
+	}
+	var got map[string]string
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["userId"] != "ben" || got["role"] != "viewer" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestSetMemberRoleTakesEffect(t *testing.T) {
+	h := newServer()
+
+	// ben starts as a contributor and can create tasks in web.
+	if code, _ := do(t, h, "POST", "/projects/web/tasks", "ben", `{"title":"x"}`); code != 201 {
+		t.Fatalf("before: create got %d want 201", code)
+	}
+
+	if code, _ := do(t, h, "PUT", "/projects/web/members/ben", "ann", `{"role":"viewer"}`); code != 200 {
+		t.Fatalf("demote: got %d want 200", code)
+	}
+
+	// After demotion ben can read but no longer write.
+	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 200 {
+		t.Fatalf("read after demote: got %d want 200", code)
+	}
+	if code, _ := do(t, h, "POST", "/projects/web/tasks", "ben", `{"title":"x"}`); code != 403 {
+		t.Fatalf("create after demote: got %d want 403", code)
+	}
+
+	// Promoting dan to contributor lets dan write.
+	if code, _ := do(t, h, "PUT", "/projects/web/members/dan", "ann", `{"role":"contributor"}`); code != 200 {
+		t.Fatalf("promote: got %d want 200", code)
+	}
+	if code, _ := do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`); code != 201 {
+		t.Fatalf("create after promote: got %d want 201", code)
+	}
+}
+
 func TestDelete(t *testing.T) {
 	cases := []struct {
 		name, user, path string

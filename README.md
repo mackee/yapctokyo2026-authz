@@ -19,6 +19,7 @@ go test ./...
 | GET | `/projects/{pid}/tasks/{tid}` | |
 | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
 | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+| PUT | `/projects/{pid}/members/{uid}` | `{"role"}` → 200 `{"userId","role"}`; role is `manager`, `contributor` or `viewer` |
 
 Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 
@@ -32,6 +33,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Only managers may delete tasks.
 - Archived projects reject all writes with 409 (reads still work).
 - A task ID that does not belong to the project in the path → 404.
+- Only managers may change a member's role. Org admins and other roles get 403. Archived projects → 409.
+- The target user must already be a member of the project, else 404. An invalid role → 400.
 
 ## Seed data
 

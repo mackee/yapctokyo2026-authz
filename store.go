@@ -36,6 +36,8 @@ const (
 
 var validStatuses = map[string]bool{"open": true, "doing": true, "done": true}
 
+var validRoles = map[string]bool{RoleManager: true, RoleContributor: true, RoleViewer: true}
+
 type Store struct {
 	mu       sync.Mutex
 	users    map[string]*User
@@ -50,6 +52,8 @@ func (s *Store) User(id string) *User { return s.users[id] }
 func (s *Store) Project(id string) *Project { return s.projects[id] }
 
 func (s *Store) Role(projectID, userID string) string { return s.members[projectID][userID] }
+
+func (s *Store) SetRole(projectID, userID, role string) { s.members[projectID][userID] = role }
 
 func (s *Store) Task(id string) *Task { return s.tasks[id] }
 

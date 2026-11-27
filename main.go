@@ -22,6 +22,8 @@ import (
 //   - only managers may delete tasks
 //   - archived projects reject all writes                      -> 409
 //   - a task ID that is not in the path project               -> 404
+//   - only managers may change member roles; the target user must be a
+//     member of the project (else 404) and the role must be valid (else 400)
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -42,6 +44,7 @@ func newServer() http.Handler {
 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
+	mux.HandleFunc("PUT /projects/{pid}/members/{uid}", s.setMemberRole)
 	return mux
 }
 
@@ -245,6 +248,60 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 		task.Assignee = *req.Assignee
 	}
 	writeJSON(w, 200, task)
+}
+
+type roleRequest struct {
+	Role string `json:"role"`
+}
+
+type memberResponse struct {
+	UserID string `json:"userId"`
+	Role   string `json:"role"`
+}
+
+func (s *server) setMemberRole(w http.ResponseWriter, r *http.Request) {
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	user := s.store.User(r.Header.Get("X-User"))
+	if user == nil {
+		writeError(w, 401, "unauthenticated")
+		return
+	}
+	project := s.store.Project(r.PathValue("pid"))
+	if project == nil || project.OrgID != user.OrgID {
+		writeError(w, 404, "not found")
+		return
+	}
+	role := s.store.Role(project.ID, user.ID)
+	if role == "" && !user.OrgAdmin {
+		writeError(w, 404, "not found")
+		return
+	}
+	if role != RoleManager {
+		writeError(w, 403, "forbidden")
+		return
+	}
+	if project.Archived {
+		writeError(w, 409, "project is archived")
+		return
+	}
+	var req roleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "invalid request body")
+		return
+	}
+	if !validRoles[req.Role] {
+		writeError(w, 400, "invalid role")
+		return
+	}
+	targetID := r.PathValue("uid")
+	if s.store.Role(project.ID, targetID) == "" {
+		writeError(w, 404, "not found")
+		return
+	}
+	s.store.SetRole(project.ID, targetID, req.Role)
+	writeJSON(w, 200, memberResponse{UserID: targetID, Role: req.Role})
 }
 
 func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
