@@ -1,0 +1,347 @@
+diff --git a/README.md b/README.md
+index 3fe8794..e6c5adf 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| PUT | `/projects/{pid}/members/{uid}` | `{"role"}` (`manager`, `contributor` or `viewer`) → 200 `{"userId","role"}` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`. Request
+ bodies are JSON (`Content-Type: application/json`).
+@@ -37,6 +38,8 @@ bodies are JSON (`Content-Type: application/json`).
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Only managers may change member roles. A user who is not a member of the project in the path → 404.
++- A member who is assigned tasks in the project must stay a contributor or manager; demoting them to viewer → 400 (unassign the tasks first).
+ 
+ ## Seed data
+ 
+diff --git a/internal/model/aggregate.go b/internal/model/aggregate.go
+index e558654..64a557e 100644
+--- a/internal/model/aggregate.go
++++ b/internal/model/aggregate.go
+@@ -126,6 +126,41 @@ func (a *updateTaskAggregate) apply(ctx context.Context, tx DB) (*Task, error) {
+ 	return t, nil
+ }
+ 
++// changeRoleAggregate changes the role of one member of one project.
++type changeRoleAggregate struct {
++	membership *Membership
++	role       string
++	assigned   []*Task // the member's tasks in the project
++}
++
++func loadChangeRole(ctx context.Context, tx DB, projectID, userID, role string) (*changeRoleAggregate, error) {
++	m, err := NewMembershipTable().Find(ctx, tx, projectID, userID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	tasks, err := m.AssignedTasks(ctx, tx)
++	if err != nil {
++		return nil, err
++	}
++	return &changeRoleAggregate{membership: m, role: role, assigned: tasks}, nil
++}
++
++func (a *changeRoleAggregate) validate() error {
++	if !isWriterRole(a.role) && len(a.assigned) > 0 {
++		return deny(ErrInvalid, "member has assigned tasks in the project and must stay a contributor or manager")
++	}
++	return nil
++}
++
++func (a *changeRoleAggregate) apply(ctx context.Context, tx DB) (*Membership, error) {
++	if err := a.membership.changeRole(ctx, tx, a.role); err != nil {
++		return nil, err
++	}
++	return a.membership, nil
++}
++
+ // deleteTaskAggregate removes one task.
+ type deleteTaskAggregate struct {
+ 	task *Task
+diff --git a/internal/model/authz.go b/internal/model/authz.go
+index 89224a1..ba6eab0 100644
+--- a/internal/model/authz.go
++++ b/internal/model/authz.go
+@@ -67,6 +67,18 @@ func (a ProjectAuthz) CanAssign(userID string) error {
+ 	return nil
+ }
+ 
++// CanManageMembers returns nil if the actor may change members' roles in the
++// project: managers only (else ErrForbidden) and not archived (else ErrArchived).
++func (a ProjectAuthz) CanManageMembers() error {
++	if !a.CanRead() || a.role != RoleManager {
++		return deny(ErrForbidden, "only managers may change member roles")
++	}
++	if a.archived {
++		return deny(ErrArchived, "project is archived")
++	}
++	return nil
++}
++
+ // TaskAuthz is what the actor may do with one task of one project.
+ type TaskAuthz struct {
+ 	project    ProjectAuthz
+@@ -121,6 +133,25 @@ func (a TaskAuthz) CanManage() error {
+ 	return nil
+ }
+ 
++// MemberAuthz is what the actor may do with one member of one project.
++type MemberAuthz struct {
++	project ProjectAuthz
++	user    string
++}
++
++// Project returns the project-level authorization the member object came from.
++func (a MemberAuthz) Project() ProjectAuthz { return a.project }
++
++// ProjectID returns the project the member belongs to.
++func (a MemberAuthz) ProjectID() string { return a.project.project }
++
++// UserID returns the member the object is bound to.
++func (a MemberAuthz) UserID() string { return a.user }
++
++// CanChangeRole returns nil if the actor may change the member's role: managers
++// only, and the project is not archived (see ProjectAuthz.CanManageMembers).
++func (a MemberAuthz) CanChangeRole() error { return a.project.CanManageMembers() }
++
+ // ---- building authorization objects -------------------------------------------------
+ 
+ // Authenticate resolves the X-User value. Unknown or missing users are 401.
+@@ -180,3 +211,18 @@ func NewTaskAuthz(ctx context.Context, db DB, pa ProjectAuthz, taskID string) (T
+ 	}
+ 	return TaskAuthz{project: pa, task: t.ID, isAssignee: t.AssigneeID == pa.actor.id}, nil
+ }
++
++// NewMemberAuthz builds the actor's authorization object for one member of the
++// project. The user must be a member of the project; otherwise ErrNotFound.
++func NewMemberAuthz(ctx context.Context, db DB, pa ProjectAuthz, userID string) (MemberAuthz, error) {
++	if !pa.CanRead() {
++		return MemberAuthz{}, deny(ErrNotFound, "not found")
++	}
++	_, err := NewMembershipTable().Find(ctx, db, pa.project, userID)
++	if errors.Is(err, ErrNoRows) {
++		return MemberAuthz{}, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return MemberAuthz{}, err
++	}
++	return MemberAuthz{project: pa, user: userID}, nil
++}
+diff --git a/internal/model/membership_table.go b/internal/model/membership_table.go
+index 3e01344..b74929a 100644
+--- a/internal/model/membership_table.go
++++ b/internal/model/membership_table.go
+@@ -2,12 +2,44 @@ package model
+ 
+ import "context"
+ 
+-// MembershipTable reads the memberships table.
++// MembershipTable reads the memberships table. ChangeRole is its operation: it
++// takes the database, the authorization object of the member, and the new role.
+ type MembershipTable struct{}
+ 
+ // NewMembershipTable returns the memberships table.
+ func NewMembershipTable() *MembershipTable { return &MembershipTable{} }
+ 
++var validRoles = map[string]bool{RoleManager: true, RoleContributor: true, RoleViewer: true}
++
++// ChangeRole sets the member's role in the project and returns the membership.
++// A member who is assigned tasks in the project must stay a contributor or
++// manager (else ErrInvalid, and nothing changes).
++func (*MembershipTable) ChangeRole(ctx context.Context, db DB, authz MemberAuthz, role string) (*Membership, error) {
++	if err := authz.CanChangeRole(); err != nil {
++		return nil, err
++	}
++	if !validRoles[role] {
++		return nil, deny(ErrInvalid, "role must be manager, contributor or viewer")
++	}
++	var m *Membership
++	if err := inTx(ctx, db, func(tx DB) error {
++		agg, err := loadChangeRole(ctx, tx, authz.ProjectID(), authz.UserID(), role)
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		if m, err = agg.apply(ctx, tx); err != nil {
++			return err
++		}
++		return nil
++	}); err != nil {
++		return nil, err
++	}
++	return m, nil
++}
++
+ // Find returns the membership of the user in the project, or ErrNoRows.
+ func (*MembershipTable) Find(ctx context.Context, db DB, projectID, userID string) (*Membership, error) {
+ 	var m Membership
+diff --git a/internal/model/record.go b/internal/model/record.go
+index b23b291..8069548 100644
+--- a/internal/model/record.go
++++ b/internal/model/record.go
+@@ -185,6 +185,12 @@ func (r *Project) save(ctx context.Context, db DB) error {
+ 	return nil
+ }
+ 
++// changeRole sets the member's role in the project.
++func (r *Membership) changeRole(ctx context.Context, db DB, role string) error {
++	r.Role = role
++	return r.save(ctx, db)
++}
++
+ func (r *Membership) save(ctx context.Context, db DB) error {
+ 	if _, err := db.ExecContext(ctx,
+ 		`INSERT INTO memberships (project_id, user_id, role) VALUES (?, ?, ?)
+diff --git a/main.go b/main.go
+index cfe3d30..78e8ee7 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,12 @@ type taskRegistry struct {
+ 	authz model.TaskAuthz
+ }
+ 
++// memberRegistry is the whole handler-visible surface under /projects/{pid}/members/{uid}.
++type memberRegistry struct {
++	db    model.DB
++	authz model.MemberAuthz
++}
++
+ func init() {
+ 	// tanukirpc logs every request through the default slog logger; keep the
+ 	// demo and test output quiet.
+@@ -83,6 +89,10 @@ func newServer() http.Handler {
+ 			tr.Patch("/", tanukirpc.NewHandler(updateTask))
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
+ 		})
++
++		tanukirpc.RouteWithTransformer(pr, memberTransformer(), "/members/{uid}", func(mr *tanukirpc.Router[*memberRegistry]) {
++			mr.Put("/", tanukirpc.NewHandler(updateMemberRole))
++		})
+ 	})
+ 	return &appHandler{Handler: r, db: conn}
+ }
+@@ -123,6 +133,19 @@ func taskTransformer() tanukirpc.Transformer[*projectRegistry, *taskRegistry] {
+ 	})
+ }
+ 
++// memberTransformer builds the actor's authorization object for {uid}. A user
++// who is not a member of the project stops here (404).
++func memberTransformer() tanukirpc.Transformer[*projectRegistry, *memberRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*projectRegistry]) (*memberRegistry, error) {
++		reg := ctx.Registry()
++		authz, err := model.NewMemberAuthz(ctx, reg.db, reg.authz, chi.URLParam(ctx.Request(), "uid"))
++		if err != nil {
++			return nil, err
++		}
++		return &memberRegistry{db: reg.db, authz: authz}, nil
++	})
++}
++
+ // ---- handlers -------------------------------------------------------------------
+ //
+ // tanukirpc decodes and validates the request body before the handler runs, so
+@@ -170,6 +193,24 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++type updateMemberRoleRequest struct {
++	Role string `json:"role" validate:"required,oneof=manager contributor viewer"`
++}
++
++type memberResponse struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++func updateMemberRole(ctx tanukirpc.Context[*memberRegistry], req updateMemberRoleRequest) (*memberResponse, error) {
++	reg := ctx.Registry()
++	m, err := model.NewMembershipTable().ChangeRole(ctx, reg.db, reg.authz, req.Role)
++	if err != nil {
++		return nil, err
++	}
++	return &memberResponse{UserID: m.UserID, Role: m.Role}, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // jsonResponseCodec encodes responses as JSON even when the request has no
+diff --git a/members_test.go b/members_test.go
+new file mode 100644
+index 0000000..06fc004
+--- /dev/null
++++ b/members_test.go
+@@ -0,0 +1,66 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestUpdateMemberRole(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager promotes viewer", "ann", "/projects/web/members/dan", `{"role":"contributor"}`, 200},
++		{"manager promotes contributor", "ann", "/projects/web/members/cat", `{"role":"manager"}`, 200},
++		{"manager demotes assignee", "ann", "/projects/web/members/ben", `{"role":"viewer"}`, 400},
++		{"invalid role", "ann", "/projects/web/members/dan", `{"role":"owner"}`, 400},
++		{"missing role", "ann", "/projects/web/members/dan", `{}`, 400},
++		{"contributor", "ben", "/projects/web/members/dan", `{"role":"contributor"}`, 403},
++		{"viewer", "dan", "/projects/web/members/cat", `{"role":"viewer"}`, 403},
++		{"org admin", "eve", "/projects/web/members/dan", `{"role":"contributor"}`, 403},
++		{"non member actor", "hal", "/projects/web/members/dan", `{"role":"contributor"}`, 404},
++		{"other org actor", "gus", "/projects/web/members/dan", `{"role":"contributor"}`, 404},
++		{"anonymous", "", "/projects/web/members/dan", `{"role":"contributor"}`, 401},
++		{"unknown user", "zed", "/projects/web/members/dan", `{"role":"contributor"}`, 401},
++		{"target not a member", "ann", "/projects/web/members/hal", `{"role":"contributor"}`, 404},
++		{"target in other org", "ann", "/projects/web/members/gus", `{"role":"contributor"}`, 404},
++		{"archived", "ann", "/projects/legacy/members/ben", `{"role":"viewer"}`, 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "PUT", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestUpdateMemberRoleResponse(t *testing.T) {
++	code, body := do(t, newServer(), "PUT", "/projects/web/members/dan", "ann", `{"role":"contributor"}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200: %s", code, body)
++	}
++	var got map[string]string
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatalf("response is not JSON: %v: %s", err, body)
++	}
++	if got["userId"] != "dan" || got["role"] != "contributor" || len(got) != 2 {
++		t.Fatalf("got %s, want {\"userId\":\"dan\",\"role\":\"contributor\"}", body)
++	}
++}
++
++func TestUpdateMemberRolePersists(t *testing.T) {
++	h := newServer()
++	// ben is the assignee of t1 in web, so demoting him is refused until the task is unassigned.
++	if code, body := do(t, h, "PATCH", "/projects/web/tasks/t1", "ann", `{"assignee":""}`); code != 200 {
++		t.Fatalf("unassign: got %d want 200: %s", code, body)
++	}
++	if code, body := do(t, h, "PUT", "/projects/web/members/ben", "ann", `{"role":"viewer"}`); code != 200 {
++		t.Fatalf("demote: got %d want 200: %s", code, body)
++	}
++	// As a viewer, ben can no longer create tasks in web.
++	if code, body := do(t, h, "POST", "/projects/web/tasks", "ben", `{"title":"x"}`); code != 403 {
++		t.Fatalf("viewer create: got %d want 403: %s", code, body)
++	}
++}

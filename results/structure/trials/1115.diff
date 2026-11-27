@@ -1,0 +1,377 @@
+diff --git a/README.md b/README.md
+index 3fe8794..c29fcba 100644
+--- a/README.md
++++ b/README.md
+@@ -22,6 +22,14 @@ go test ./...
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+ 
++| POST | `/orgs/{orgID}/users/{uid}/transfer` | `{"toOrgId"}` → 200 `{"id","orgId"}` |
++
++Transfer: only an org admin of `{orgID}` (other orgs get 404, non-admins 403);
++the user must belong to `{orgID}` (else 404) and `toOrgId` must be a different,
++existing organization (else 400). Because project members must belong to the
++project's organization, the user is removed from all their projects, their
++tasks are unassigned, and they do not keep org admin rights.
++
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`. Request
+ bodies are JSON (`Content-Type: application/json`).
+ 
+diff --git a/internal/model/aggregate.go b/internal/model/aggregate.go
+index e558654..00f2c8c 100644
+--- a/internal/model/aggregate.go
++++ b/internal/model/aggregate.go
+@@ -126,6 +126,73 @@ func (a *updateTaskAggregate) apply(ctx context.Context, tx DB) (*Task, error) {
+ 	return t, nil
+ }
+ 
++// transferUserAggregate moves one user to another organization. Because project
++// members must belong to the project's organization, it also removes the
++// user's memberships and unassigns their tasks.
++type transferUserAggregate struct {
++	user        *User
++	fromOrg     string
++	toOrg       string
++	memberships []*Membership
++	tasks       []*Task
++	toOrgExists bool
++}
++
++func loadTransferUser(ctx context.Context, tx DB, fromOrg, userID string, in UserTableTransferInput) (*transferUserAggregate, error) {
++	u, err := NewUserTable().Find(ctx, tx, userID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	a := &transferUserAggregate{user: u, fromOrg: fromOrg, toOrg: in.ToOrg}
++	if u.Org != fromOrg {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	if a.memberships, err = u.Memberships(ctx, tx); err != nil {
++		return nil, err
++	}
++	if a.tasks, err = u.AssignedTasks(ctx, tx); err != nil {
++		return nil, err
++	}
++	if a.toOrgExists, err = NewUserTable().ExistsInOrg(ctx, tx, in.ToOrg); err != nil {
++		return nil, err
++	}
++	if !a.toOrgExists {
++		if a.toOrgExists, err = NewProjectTable().ExistsInOrg(ctx, tx, in.ToOrg); err != nil {
++			return nil, err
++		}
++	}
++	return a, nil
++}
++
++func (a *transferUserAggregate) validate() error {
++	if a.toOrg == "" || a.toOrg == a.fromOrg {
++		return deny(ErrInvalid, "toOrgId must be a different organization")
++	}
++	if !a.toOrgExists {
++		return deny(ErrInvalid, "unknown organization")
++	}
++	return nil
++}
++
++func (a *transferUserAggregate) apply(ctx context.Context, tx DB) (*User, error) {
++	for _, t := range a.tasks {
++		if err := t.unassign(ctx, tx); err != nil {
++			return nil, err
++		}
++	}
++	for _, m := range a.memberships {
++		if err := m.destroy(ctx, tx); err != nil {
++			return nil, err
++		}
++	}
++	if err := a.user.moveToOrg(ctx, tx, a.toOrg); err != nil {
++		return nil, err
++	}
++	return a.user, nil
++}
++
+ // deleteTaskAggregate removes one task.
+ type deleteTaskAggregate struct {
+ 	task *Task
+diff --git a/internal/model/authz.go b/internal/model/authz.go
+index 89224a1..6b0c8cb 100644
+--- a/internal/model/authz.go
++++ b/internal/model/authz.go
+@@ -121,6 +121,33 @@ func (a TaskAuthz) CanManage() error {
+ 	return nil
+ }
+ 
++// OrgAuthz is what the actor may do in one organization (their own).
++type OrgAuthz struct {
++	actor Actor
++	org   string
++}
++
++// OrgID returns the organization the object is bound to.
++func (a OrgAuthz) OrgID() string { return a.org }
++
++// CanManageUsers returns nil if the actor may manage the organization's users
++// (transfer them): org admins only (else ErrForbidden).
++func (a OrgAuthz) CanManageUsers() error {
++	if a.org == "" || a.actor.org != a.org || !a.actor.orgAdmin {
++		return deny(ErrForbidden, "only org admins may manage users")
++	}
++	return nil
++}
++
++// NewOrgAuthz builds the actor's authorization object for an organization.
++// The actor must belong to it; otherwise ErrNotFound.
++func NewOrgAuthz(act Actor, orgID string) (OrgAuthz, error) {
++	if act.org != orgID {
++		return OrgAuthz{}, deny(ErrNotFound, "not found")
++	}
++	return OrgAuthz{actor: act, org: orgID}, nil
++}
++
+ // ---- building authorization objects -------------------------------------------------
+ 
+ // Authenticate resolves the X-User value. Unknown or missing users are 401.
+diff --git a/internal/model/project_table.go b/internal/model/project_table.go
+index 99b03d6..db18d79 100644
+--- a/internal/model/project_table.go
++++ b/internal/model/project_table.go
+@@ -8,6 +8,15 @@ type ProjectTable struct{}
+ // NewProjectTable returns the projects table.
+ func NewProjectTable() *ProjectTable { return &ProjectTable{} }
+ 
++// ExistsInOrg reports whether the organization has any project.
++func (*ProjectTable) ExistsInOrg(ctx context.Context, db DB, org string) (bool, error) {
++	var n int
++	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE org_id = ?`, org).Scan(&n); err != nil {
++		return false, err
++	}
++	return n > 0, nil
++}
++
+ // Find returns the project with the ID, or ErrNoRows.
+ func (*ProjectTable) Find(ctx context.Context, db DB, id string) (*Project, error) {
+ 	var p Project
+diff --git a/internal/model/record.go b/internal/model/record.go
+index b23b291..e44b35f 100644
+--- a/internal/model/record.go
++++ b/internal/model/record.go
+@@ -15,9 +15,9 @@ import (
+ 
+ // User is a row of the users table.
+ type User struct {
+-	ID       string
+-	Org      string
+-	OrgAdmin bool // org admins may read every project in their org, but cannot write
++	ID       string `json:"id"`
++	Org      string `json:"orgId"`
++	OrgAdmin bool   `json:"-"` // org admins may read every project in their org, but cannot write
+ }
+ 
+ // Project is a row of the projects table.
+@@ -170,6 +170,21 @@ func (r *Task) save(ctx context.Context, db DB) error {
+ 	return nil
+ }
+ 
++// destroy removes the membership.
++func (r *Membership) destroy(ctx context.Context, db DB) error {
++	_, err := db.ExecContext(ctx, `DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, r.ProjectID, r.UserID)
++	return err
++}
++
++// moveToOrg moves the user to another organization. The user leaves every
++// project of the old organization (memberships are removed and assigned tasks
++// unassigned by the caller) and does not carry org admin rights over.
++func (r *User) moveToOrg(ctx context.Context, db DB, org string) error {
++	r.Org = org
++	r.OrgAdmin = false
++	return r.save(ctx, db)
++}
++
+ func (r *User) save(ctx context.Context, db DB) error {
+ 	if _, err := db.ExecContext(ctx, `UPDATE users SET org_id = ?, org_admin = ? WHERE id = ?`, r.Org, r.OrgAdmin, r.ID); err != nil {
+ 		return err
+diff --git a/internal/model/user_table.go b/internal/model/user_table.go
+index 4905832..61d2b8d 100644
+--- a/internal/model/user_table.go
++++ b/internal/model/user_table.go
+@@ -8,6 +8,45 @@ type UserTable struct{}
+ // NewUserTable returns the users table.
+ func NewUserTable() *UserTable { return &UserTable{} }
+ 
++// ExistsInOrg reports whether the organization has any user.
++func (*UserTable) ExistsInOrg(ctx context.Context, db DB, org string) (bool, error) {
++	var n int
++	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE org_id = ?`, org).Scan(&n); err != nil {
++		return false, err
++	}
++	return n > 0, nil
++}
++
++// UserTableTransferInput is the input of UserTable.Transfer.
++type UserTableTransferInput struct {
++	ToOrg string
++}
++
++// Transfer moves the user from the authorized organization to another one.
++// Only an org admin of the user's current organization may do it. The user
++// leaves all projects of the old organization (memberships removed, assigned
++// tasks unassigned) and loses org admin rights.
++func (*UserTable) Transfer(ctx context.Context, db DB, authz OrgAuthz, userID string, in UserTableTransferInput) (*User, error) {
++	if err := authz.CanManageUsers(); err != nil {
++		return nil, err
++	}
++	var u *User
++	if err := inTx(ctx, db, func(tx DB) error {
++		agg, err := loadTransferUser(ctx, tx, authz.OrgID(), userID, in)
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		u, err = agg.apply(ctx, tx)
++		return err
++	}); err != nil {
++		return nil, err
++	}
++	return u, nil
++}
++
+ // Find returns the user with the ID, or ErrNoRows.
+ func (*UserTable) Find(ctx context.Context, db DB, id string) (*User, error) {
+ 	var u User
+diff --git a/main.go b/main.go
+index 5bcd29e..34b2346 100644
+--- a/main.go
++++ b/main.go
+@@ -37,6 +37,12 @@ type Task = model.Task
+ 
+ type rootRegistry struct{}
+ 
++// orgRegistry is the whole handler-visible surface under /orgs/{orgID}.
++type orgRegistry struct {
++	db    model.DB
++	authz model.OrgAuthz
++}
++
+ // projectRegistry is the whole handler-visible surface under /projects/{pid}.
+ type projectRegistry struct {
+ 	db    model.DB
+@@ -74,6 +80,10 @@ func newServer() http.Handler {
+ 		tanukirpc.WithAccessLogger[*rootRegistry](nil),
+ 	)
+ 
++	tanukirpc.RouteWithTransformer(r, orgTransformer(conn), "/orgs/{orgID}", func(or *tanukirpc.Router[*orgRegistry]) {
++		or.Post("/users/{uid}/transfer", tanukirpc.NewHandler(transferUser))
++	})
++
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(conn), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
+@@ -87,6 +97,31 @@ func newServer() http.Handler {
+ 	return r
+ }
+ 
++// orgTransformer authenticates the caller and builds the actor's
++// authorization object for {orgID}. Other organizations stop here (404).
++func orgTransformer(conn *sql.DB) tanukirpc.Transformer[*rootRegistry, *orgRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*rootRegistry]) (*orgRegistry, error) {
++		actor, err := model.Authenticate(ctx, conn, ctx.Request().Header.Get("X-User"))
++		if err != nil {
++			return nil, err
++		}
++		authz, err := model.NewOrgAuthz(actor, chi.URLParam(ctx.Request(), "orgID"))
++		if err != nil {
++			return nil, err
++		}
++		return &orgRegistry{db: conn, authz: authz}, nil
++	})
++}
++
++type transferRequest struct {
++	ToOrgID string `json:"toOrgId" validate:"required"`
++}
++
++func transferUser(ctx tanukirpc.Context[*orgRegistry], req transferRequest) (*model.User, error) {
++	reg := ctx.Registry()
++	return model.NewUserTable().Transfer(ctx, reg.db, reg.authz, chi.URLParam(ctx.Request(), "uid"), model.UserTableTransferInput{ToOrg: req.ToOrgID})
++}
++
+ // projectTransformer authenticates the caller and builds the actor's
+ // authorization object for {pid}. Unreadable projects stop here (404).
+ func projectTransformer(conn *sql.DB) tanukirpc.Transformer[*rootRegistry, *projectRegistry] {
+diff --git a/transfer_test.go b/transfer_test.go
+new file mode 100644
+index 0000000..3402e0a
+--- /dev/null
++++ b/transfer_test.go
+@@ -0,0 +1,67 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestTransfer(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"org admin transfers", "eve", "/orgs/acme/users/ben/transfer", `{"toOrgId":"globex"}`, 200},
++		{"non admin forbidden", "ann", "/orgs/acme/users/ben/transfer", `{"toOrgId":"globex"}`, 403},
++		{"other org admin cannot", "gus", "/orgs/acme/users/ben/transfer", `{"toOrgId":"globex"}`, 404},
++		{"user in another org", "eve", "/orgs/acme/users/gus/transfer", `{"toOrgId":"acme"}`, 404},
++		{"unknown user", "eve", "/orgs/acme/users/zed/transfer", `{"toOrgId":"globex"}`, 404},
++		{"same org", "eve", "/orgs/acme/users/ben/transfer", `{"toOrgId":"acme"}`, 400},
++		{"unknown target org", "eve", "/orgs/acme/users/ben/transfer", `{"toOrgId":"nowhere"}`, 400},
++		{"missing body field", "eve", "/orgs/acme/users/ben/transfer", `{}`, 400},
++		{"anonymous", "", "/orgs/acme/users/ben/transfer", `{"toOrgId":"globex"}`, 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, body := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d body=%s", code, c.want, body)
++			}
++		})
++	}
++}
++
++func TestTransferResponseAndCleanup(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/orgs/acme/users/ben/transfer", "eve", `{"toOrgId":"globex"}`)
++	if code != 200 {
++		t.Fatal(code, body)
++	}
++	var got map[string]string
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	if len(got) != 2 || got["id"] != "ben" || got["orgId"] != "globex" {
++		t.Fatalf("unexpected response %s", body)
++	}
++
++	// ben left the acme projects: no access, and his tasks are unassigned.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("ben still reads web: %d", code)
++	}
++	_, body = do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
++	var task Task
++	json.Unmarshal([]byte(body), &task)
++	if task.AssigneeID != "" {
++		t.Fatalf("t1 still assigned to %q", task.AssigneeID)
++	}
++}
++
++func TestTransferDropsOrgAdmin(t *testing.T) {
++	h := newServer()
++	if code, body := do(t, h, "POST", "/orgs/acme/users/eve/transfer", "eve", `{"toOrgId":"globex"}`); code != 200 {
++		t.Fatal(code, body)
++	}
++	if code, _ := do(t, h, "GET", "/projects/gx/tasks", "eve", ""); code != 404 {
++		t.Fatalf("transferred admin kept org admin rights: %d", code)
++	}
++}

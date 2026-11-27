@@ -1,0 +1,263 @@
+diff --git a/README.md b/README.md
+index ba637dd..dafa8f3 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| PUT | `/projects/{pid}/members` | `{"roles":{"<userId>":"<role>",...}}` → 200 with the full member list `[{"userId","role"}]` (sorted by userId) |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,10 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Changing member roles (`PUT /projects/{pid}/members`) requires the `manager` role in the project; anyone else who can read it gets 403.
++- A role batch is all-or-nothing: if any target is not a member (404) or any role is not `manager`/`contributor`/`viewer` (400), nothing changes.
++- A batch may not leave the project without a manager → 409.
++- Archived projects reject role changes with 409.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 6152a73..a7bc003 100644
+--- a/main.go
++++ b/main.go
+@@ -5,6 +5,7 @@ import (
+ 	"flag"
+ 	"log"
+ 	"net/http"
++	"sort"
+ )
+ 
+ // Taskboard: a tiny project task tracker.
+@@ -22,6 +23,9 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - changing member roles needs the manager role in the project;
++//     the batch is all-or-nothing and must leave at least one manager
++//     (archived projects -> 409)
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -42,6 +46,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("PUT /projects/{pid}/members", s.updateMembers)
+ 	return mux
+ }
+ 
+@@ -282,3 +287,82 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	s.store.DeleteTask(task.ID)
+ 	w.WriteHeader(204)
+ }
++
++type membersRequest struct {
++	Roles map[string]string `json:"roles"`
++}
++
++// updateMembers changes several members' roles at once. Every change is
++// validated before any is applied, so a failure leaves all roles untouched.
++func (s *server) updateMembers(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	user := s.store.User(r.Header.Get("X-User"))
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project := s.store.Project(r.PathValue("pid"))
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role := s.store.Role(project.ID, user.ID)
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "only managers may change member roles")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req membersRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Roles) == 0 {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++
++	// Validate in sorted order so the reported error is deterministic.
++	userIDs := make([]string, 0, len(req.Roles))
++	for uid := range req.Roles {
++		userIDs = append(userIDs, uid)
++	}
++	sort.Strings(userIDs)
++	for _, uid := range userIDs {
++		newRole := req.Roles[uid]
++		if newRole != RoleManager && newRole != RoleContributor && newRole != RoleViewer {
++			writeError(w, 400, "invalid role for "+uid)
++			return
++		}
++		if s.store.Role(project.ID, uid) == "" {
++			writeError(w, 404, uid+" is not a member of the project")
++			return
++		}
++	}
++
++	// The project must keep at least one manager after the change.
++	managers := 0
++	for _, m := range s.store.MembersInProject(project.ID) {
++		effective := m.Role
++		if newRole, ok := req.Roles[m.UserID]; ok {
++			effective = newRole
++		}
++		if effective == RoleManager {
++			managers++
++		}
++	}
++	if managers == 0 {
++		writeError(w, 409, "project must keep at least one manager")
++		return
++	}
++
++	for _, uid := range userIDs {
++		s.store.SetRole(project.ID, uid, req.Roles[uid])
++	}
++	writeJSON(w, 200, s.store.MembersInProject(project.ID))
++}
+diff --git a/main_test.go b/main_test.go
+index 0277f51..295112d 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,93 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestUpdateMembers(t *testing.T) {
++	cases := []struct {
++		name, user, project, body string
++		want                      int
++	}{
++		{"manager batch", "ann", "web", `{"roles":{"ben":"viewer","dan":"contributor"}}`, 200},
++		{"manager self demote with other manager", "ann", "web", `{"roles":{"ann":"contributor"}}`, 200},
++		{"contributor", "ben", "web", `{"roles":{"cat":"viewer"}}`, 403},
++		{"viewer", "dan", "web", `{"roles":{"ben":"viewer"}}`, 403},
++		{"org admin without role", "eve", "web", `{"roles":{"ben":"viewer"}}`, 403},
++		{"non member", "hal", "web", `{"roles":{"ben":"viewer"}}`, 404},
++		{"other org", "gus", "web", `{"roles":{"ben":"viewer"}}`, 404},
++		{"archived", "ann", "legacy", `{"roles":{"ben":"viewer"}}`, 409},
++		{"unknown target user", "ann", "web", `{"roles":{"zed":"viewer"}}`, 404},
++		{"non member target", "ann", "web", `{"roles":{"hal":"viewer"}}`, 404},
++		{"invalid role", "ann", "web", `{"roles":{"ben":"owner"}}`, 400},
++		{"empty roles", "ann", "web", `{"roles":{}}`, 400},
++		{"missing roles", "ann", "web", `{}`, 400},
++		{"malformed body", "ann", "web", `{"roles":`, 400},
++		{"demote all managers", "ann", "web", `{"roles":{"ann":"viewer","ivy":"contributor"}}`, 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "PUT", "/projects/"+c.project+"/members", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestUpdateMembersAnonymous(t *testing.T) {
++	code, _ := do(t, newServer(), "PUT", "/projects/web/members", "", `{"roles":{"ben":"viewer"}}`)
++	if code != 401 {
++		t.Fatalf("got %d want 401", code)
++	}
++}
++
++func TestUpdateMembersResponse(t *testing.T) {
++	code, body := do(t, newServer(), "PUT", "/projects/web/members", "ann",
++		`{"roles":{"ben":"viewer","dan":"contributor"}}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var got []Member
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := []Member{
++		{UserID: "ann", Role: "manager"},
++		{UserID: "ben", Role: "viewer"},
++		{UserID: "cat", Role: "contributor"},
++		{UserID: "dan", Role: "contributor"},
++		{UserID: "ivy", Role: "manager"},
++	}
++	if len(got) != len(want) {
++		t.Fatalf("got %d members, want %d: %s", len(got), len(want), body)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("member %d: got %+v want %+v", i, got[i], want[i])
++		}
++	}
++}
++
++func TestUpdateMembersIsAllOrNothing(t *testing.T) {
++	h := newServer()
++	// hal is not a member, so the whole batch must be rejected...
++	code, _ := do(t, h, "PUT", "/projects/web/members", "ann",
++		`{"roles":{"ben":"viewer","hal":"viewer"}}`)
++	if code != 404 {
++		t.Fatalf("got %d want 404", code)
++	}
++	// ...and ben's role must be unchanged, as shown by a later successful call.
++	code, body := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"cat":"viewer"}}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var got []Member
++	json.Unmarshal([]byte(body), &got)
++	for _, m := range got {
++		if m.UserID == "ben" && m.Role != "contributor" {
++			t.Fatalf("ben changed despite failed batch: %+v", m)
++		}
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string
+diff --git a/store.go b/store.go
+index f468b2d..e8cc083 100644
+--- a/store.go
++++ b/store.go
+@@ -51,6 +51,24 @@ func (s *Store) Project(id string) *Project { return s.projects[id] }
+ 
+ func (s *Store) Role(projectID, userID string) string { return s.members[projectID][userID] }
+ 
++// Member is one project membership as returned by the members API.
++type Member struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++// MembersInProject returns the project's members sorted by user ID.
++func (s *Store) MembersInProject(projectID string) []Member {
++	out := []Member{}
++	for uid, role := range s.members[projectID] {
++		out = append(out, Member{UserID: uid, Role: role})
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
++	return out
++}
++
++func (s *Store) SetRole(projectID, userID, role string) { s.members[projectID][userID] = role }
++
+ func (s *Store) Task(id string) *Task { return s.tasks[id] }
+ 
+ func (s *Store) TasksInProject(projectID string) []*Task {

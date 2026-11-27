@@ -1,0 +1,138 @@
+diff --git a/README.md b/README.md
+index ba637dd..c6ffda9 100644
+--- a/README.md
++++ b/README.md
+@@ -15,7 +15,7 @@ go test ./...
+ | Method | Path | Notes |
+ | --- | --- | --- |
+ | GET | `/projects/{pid}/tasks` | list tasks of a project |
+-| POST | `/projects/{pid}/tasks` | `{"title","assignee"}` → 201 |
++| POST | `/projects/{pid}/tasks` | `{"title","assignee"}` → 201; a non-member assignee in the same organization is added to the project as a `contributor` |
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+@@ -32,6 +32,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Creating a task with an `assignee` who is not yet a project member adds that user to the project as a `contributor`, then creates the task (201). The assignee must exist and belong to the project's organization, otherwise 400. An assignee who is already a `viewer` gets 400. Contributors may only assign tasks to themselves, so they cannot add other users this way.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 6152a73..a34ca9a 100644
+--- a/main.go
++++ b/main.go
+@@ -145,16 +145,30 @@ func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
+ 		writeError(w, 400, "invalid request body")
+ 		return
+ 	}
++	addAssigneeAsContributor := false
+ 	if req.Assignee != "" {
+-		assigneeRole := s.store.Role(project.ID, req.Assignee)
+-		if assigneeRole != RoleManager && assigneeRole != RoleContributor {
+-			writeError(w, 400, "assignee must be a contributor or manager of the project")
+-			return
+-		}
+ 		if role == RoleContributor && req.Assignee != user.ID {
+ 			writeError(w, 403, "contributors may only assign tasks to themselves")
+ 			return
+ 		}
++		assignee := s.store.User(req.Assignee)
++		if assignee == nil || assignee.OrgID != project.OrgID {
++			writeError(w, 400, "assignee must be a user of the project's organization")
++			return
++		}
++		switch s.store.Role(project.ID, req.Assignee) {
++		case RoleManager, RoleContributor:
++		case "":
++			// Not yet a member: they join as a contributor as part of this create.
++			addAssigneeAsContributor = true
++		default:
++			writeError(w, 400, "assignee must be a contributor or manager of the project")
++			return
++		}
++	}
++	// All validation has passed; only now change membership and store the task.
++	if addAssigneeAsContributor {
++		s.store.AddMember(project.ID, req.Assignee, RoleContributor)
+ 	}
+ 	task := &Task{
+ 		ID:        s.store.NewTaskID(),
+diff --git a/main_test.go b/main_test.go
+index 0277f51..419a5d5 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -76,6 +76,11 @@ func TestCreate(t *testing.T) {
+ 		{"archived", "ann", "legacy", `{"title":"x"}`, 409},
+ 		{"empty title", "ann", "web", `{"title":""}`, 400},
+ 		{"assignee viewer", "ann", "web", `{"title":"x","assignee":"dan"}`, 400},
++		{"assignee non member", "ann", "web", `{"title":"x","assignee":"hal"}`, 201},
++		{"assignee org admin non member", "ann", "web", `{"title":"x","assignee":"eve"}`, 201},
++		{"assignee unknown user", "ann", "web", `{"title":"x","assignee":"zed"}`, 400},
++		{"assignee other org", "ann", "web", `{"title":"x","assignee":"gus"}`, 400},
++		{"contributor assigns non member", "ben", "web", `{"title":"x","assignee":"hal"}`, 403},
+ 	}
+ 	for _, c := range cases {
+ 		t.Run(c.name, func(t *testing.T) {
+@@ -87,6 +92,41 @@ func TestCreate(t *testing.T) {
+ 	}
+ }
+ 
++func TestCreateAddsNonMemberAssigneeAsContributor(t *testing.T) {
++	srv := newServer()
++
++	// hal is not in web: cannot read it yet.
++	if code, _ := do(t, srv, "GET", "/projects/web/tasks", "hal", ""); code != 404 {
++		t.Fatalf("before create: list got %d want 404", code)
++	}
++
++	code, body := do(t, srv, "POST", "/projects/web/tasks", "ann", `{"title":"new","assignee":"hal"}`)
++	if code != 201 {
++		t.Fatalf("create got %d want 201: %s", code, body)
++	}
++	var created Task
++	if err := json.Unmarshal([]byte(body), &created); err != nil {
++		t.Fatal(err)
++	}
++	if created.Assignee != "hal" || created.ProjectID != "web" {
++		t.Fatalf("unexpected task: %+v", created)
++	}
++
++	// hal is now a member, so can read the project...
++	if code, _ := do(t, srv, "GET", "/projects/web/tasks", "hal", ""); code != 200 {
++		t.Fatalf("after create: list got %d want 200", code)
++	}
++	// ...and, as a contributor assigned the task, can modify it.
++	path := "/projects/web/tasks/" + created.ID
++	if code, _ := do(t, srv, "PATCH", path, "hal", `{"status":"doing"}`); code != 200 {
++		t.Fatalf("hal patch own task got %d want 200", code)
++	}
++	// Contributors still cannot delete, so role is contributor, not manager.
++	if code, _ := do(t, srv, "DELETE", path, "hal", ""); code != 403 {
++		t.Fatalf("hal delete got %d want 403", code)
++	}
++}
++
+ func TestUpdate(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path, body string
+diff --git a/store.go b/store.go
+index f468b2d..346733a 100644
+--- a/store.go
++++ b/store.go
+@@ -51,6 +51,14 @@ func (s *Store) Project(id string) *Project { return s.projects[id] }
+ 
+ func (s *Store) Role(projectID, userID string) string { return s.members[projectID][userID] }
+ 
++// AddMember sets userID's role in projectID, creating the project's member map if needed.
++func (s *Store) AddMember(projectID, userID, role string) {
++	if s.members[projectID] == nil {
++		s.members[projectID] = map[string]string{}
++	}
++	s.members[projectID][userID] = role
++}
++
+ func (s *Store) Task(id string) *Task { return s.tasks[id] }
+ 
+ func (s *Store) TasksInProject(projectID string) []*Task {

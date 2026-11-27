@@ -1,0 +1,208 @@
+diff --git a/README.md b/README.md
+index ba637dd..9c4226f 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| GET | `/search/tasks?q=` | tasks whose title contains `q` (case-sensitive), across all projects the caller can read; each task includes `projectId`; empty `q` → 400 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Search only returns tasks from projects the user could read. Tasks in other projects are omitted silently, not reported as 403/404.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 6152a73..2d4fabd 100644
+--- a/main.go
++++ b/main.go
+@@ -22,6 +22,8 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - search returns only tasks the user could read in their
++//     own projects, across projects; no q                     -> 400
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -42,6 +44,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("GET /search/tasks", s.searchTasks)
+ 	return mux
+ }
+ 
+@@ -108,6 +111,37 @@ func (s *server) getTask(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, 200, task)
+ }
+ 
++// searchTasks returns tasks whose title contains q, across every project the
++// caller can read. Projects the caller cannot read are skipped silently, so
++// their tasks never appear and the result reveals nothing about them.
++func (s *server) searchTasks(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	user := s.store.User(r.Header.Get("X-User"))
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	q := r.URL.Query().Get("q")
++	if q == "" {
++		writeError(w, 400, "q is required")
++		return
++	}
++	tasks := []*Task{}
++	for _, t := range s.store.TasksWithTitleContaining(q) {
++		project := s.store.Project(t.ProjectID)
++		if project == nil || project.OrgID != user.OrgID {
++			continue
++		}
++		if s.store.Role(project.ID, user.ID) == "" && !user.OrgAdmin {
++			continue
++		}
++		tasks = append(tasks, t)
++	}
++	writeJSON(w, 200, tasks)
++}
++
+ type createRequest struct {
+ 	Title    string `json:"title"`
+ 	Assignee string `json:"assignee"`
+diff --git a/main_test.go b/main_test.go
+index 0277f51..a88eb34 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"net/http"
+ 	"net/http/httptest"
++	"net/url"
+ 	"strings"
+ 	"testing"
+ )
+@@ -113,6 +114,84 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestSearch(t *testing.T) {
++	cases := []struct {
++		name, user, q string
++		want          int
++		wantCount     int // -1 to skip the count check
++	}{
++		{"member finds", "ann", "header", 200, 1},
++		{"viewer member finds", "dan", "header", 200, 1},
++		{"org admin sees own org", "eve", "header", 200, 1},
++		{"non member gets empty", "hal", "header", 200, 0},
++		{"other org gets empty", "gus", "header", 200, 0},
++		{"other org task hidden from acme", "ann", "secret", 200, 0},
++		{"org admin cannot see other org", "eve", "secret", 200, 0},
++		{"other org member finds own", "gus", "secret", 200, 1},
++		{"archived readable", "ben", "Old bug", 200, 1},
++		{"no match", "ann", "nomatch", 200, 0},
++		{"case sensitive", "ann", "HEADER", 200, 0},
++		{"anonymous", "", "header", 401, -1},
++		{"unknown user", "zed", "header", 401, -1},
++		{"empty q", "ann", "", 400, -1},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			path := "/search/tasks?q=" + url.QueryEscape(c.q)
++			code, body := do(t, newServer(), "GET", path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d (body %s)", code, c.want, body)
++			}
++			if c.wantCount < 0 {
++				return
++			}
++			var tasks []Task
++			if err := json.Unmarshal([]byte(body), &tasks); err != nil {
++				t.Fatalf("body is not a task array: %v (%s)", err, body)
++			}
++			if len(tasks) != c.wantCount {
++				t.Fatalf("got %d tasks want %d (%s)", len(tasks), c.wantCount, body)
++			}
++		})
++	}
++}
++
++func TestSearchEmptyIsArray(t *testing.T) {
++	code, body := do(t, newServer(), "GET", "/search/tasks?q=nomatch", "ann", "")
++	if code != 200 {
++		t.Fatal(code)
++	}
++	if strings.TrimSpace(body) != "[]" {
++		t.Fatalf("want [] got %s", body)
++	}
++}
++
++func TestSearchAcrossProjectsIncludesProjectID(t *testing.T) {
++	h := newServer()
++	// ivy is a manager of both web and ops, so she can create a matching task in ops.
++	if code, body := do(t, h, "POST", "/projects/ops/tasks", "ivy", `{"title":"Fix header in ops"}`); code != 201 {
++		t.Fatalf("setup: got %d (%s)", code, body)
++	}
++	code, body := do(t, h, "GET", "/search/tasks?q=header", "ann", "")
++	if code != 200 {
++		t.Fatalf("got %d (%s)", code, body)
++	}
++	var tasks []Task
++	if err := json.Unmarshal([]byte(body), &tasks); err != nil {
++		t.Fatal(err)
++	}
++	seen := map[string]bool{}
++	for _, task := range tasks {
++		if task.ProjectID == "" {
++			t.Fatalf("task %s has no projectId", task.ID)
++		}
++		seen[task.ProjectID] = true
++	}
++	if len(tasks) != 2 || !seen["web"] || !seen["ops"] {
++		t.Fatalf("want header tasks from web and ops, got %s", body)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string
+diff --git a/store.go b/store.go
+index f468b2d..04eb909 100644
+--- a/store.go
++++ b/store.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"fmt"
+ 	"sort"
++	"strings"
+ 	"sync"
+ )
+ 
+@@ -64,6 +65,19 @@ func (s *Store) TasksInProject(projectID string) []*Task {
+ 	return out
+ }
+ 
++// TasksWithTitleContaining returns tasks from all projects whose title contains
++// q (case-sensitive), sorted by ID. Access checks are the caller's job.
++func (s *Store) TasksWithTitleContaining(q string) []*Task {
++	var out []*Task
++	for _, t := range s.tasks {
++		if strings.Contains(t.Title, q) {
++			out = append(out, t)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
++	return out
++}
++
+ func (s *Store) NewTaskID() string {
+ 	s.nextID++
+ 	return fmt.Sprintf("t%d", s.nextID)

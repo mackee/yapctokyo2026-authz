@@ -1,0 +1,209 @@
+diff --git a/README.md b/README.md
+index 8d54490..8e6a2eb 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/tasks/{tid}/move` | `{"toProjectId"}` → 200 with the moved task |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -30,6 +31,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Moving a task requires the `manager` role in the source project and write access (contributor or manager) in the destination. The task keeps its ID, title, status and assignee; if the assignee is not a contributor or manager of the destination the move is rejected with 400. Moving to the same project is 400; a destination that is missing or in another organization is 404.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..ebde51b 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -125,6 +125,7 @@ type ProjectScope interface {
+ 
+ // TaskScope is bound to one actor, one project ID and one task ID.
+ type TaskScope interface {
++	Actor() ActorScope
+ 	Read() (ReadTask, error)
+ 	Edit() (EditTask, error)
+ 	Manage() (ManageTask, error)
+@@ -301,6 +302,8 @@ type EditTask interface {
+ type ManageTask interface {
+ 	EditTask
+ 	Delete() error
++	// MoveTo moves the task to the project dest was acquired for.
++	MoveTo(dest WriteProject) (TaskView, error)
+ }
+ 
+ type taskScope struct {
+@@ -322,6 +325,8 @@ func locate(s *state, act Actor, pid, tid string) (project, string, task, error)
+ 	return p, role, t, nil
+ }
+ 
++func (s *taskScope) Actor() ActorScope { return s.ps.as }
++
+ func (s *taskScope) Read() (ReadTask, error) {
+ 	err := s.ps.as.a.st.read(func(st *state) error {
+ 		_, _, _, err := locate(st, s.ps.as.actor, s.ps.pid, s.tid)
+@@ -426,6 +431,38 @@ func (t *editTask) Apply(p TaskPatch) (TaskView, error) {
+ 
+ type manageTask struct{ editTask }
+ 
++// MoveTo moves the task into the project that dest was acquired for. The
++// caller has already proven manager rights on the source (Manage) and write
++// rights on the destination (dest). ID, title, status and assignee are kept;
++// the assignee is re-admitted for the destination, so a move whose assignee is
++// not a contributor or manager there is rejected (400) and nothing changes.
++func (t *manageTask) MoveTo(dest WriteProject) (TaskView, error) {
++	d, ok := dest.(*writeProject)
++	if !ok || d.ps.as.actor != t.ts.ps.as.actor {
++		return TaskView{}, deny(ErrForbidden, "forbidden")
++	}
++	if d.ps.pid == t.ts.ps.pid {
++		return TaskView{}, deny(ErrInvalid, "task is already in that project")
++	}
++	var v TaskView
++	err := t.ts.ps.as.a.st.tx(func(s *state) error {
++		cur, ok := s.tasks[t.ts.tid]
++		if !ok || cur.project != t.ts.ps.pid {
++			return deny(ErrNotFound, "not found")
++		}
++		a, err := admit(s, d.ps.pid, cur.assignee.user)
++		if err != nil {
++			return err
++		}
++		cur.project = d.ps.pid
++		cur.assignee = a
++		s.tasks[cur.id] = cur
++		v = cur.view()
++		return nil
++	})
++	return v, err
++}
++
+ func (t *manageTask) Delete() error {
+ 	return t.ts.ps.as.a.st.tx(func(s *state) error {
+ 		delete(s.tasks, t.ts.tid)
+diff --git a/main.go b/main.go
+index 29de540..d9d2b64 100644
+--- a/main.go
++++ b/main.go
+@@ -76,6 +76,7 @@ func newServer() http.Handler {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+ 			tr.Patch("/", tanukirpc.NewHandler(updateTask))
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
++			tr.Post("/move", tanukirpc.NewHandler(moveTask))
+ 		})
+ 	})
+ 	return r
+@@ -177,6 +178,33 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++type moveRequest struct {
++	ToProjectID string `json:"toProjectId"`
++}
++
++// moveTask needs manager rights on the source project and write rights on the
++// destination project.
++func moveTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Task, error) {
++	scope := ctx.Registry().scope
++	t, err := scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	var req moveRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil || req.ToProjectID == "" {
++		return nil, errInvalidBody
++	}
++	dest, err := scope.Actor().Project(req.ToProjectID).Write()
++	if err != nil {
++		return nil, err
++	}
++	v, err := t.MoveTo(dest)
++	if err != nil {
++		return nil, err
++	}
++	return &v, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // httpError is an error with an explicit status for request-shape problems
+diff --git a/main_test.go b/main_test.go
+index 0277f51..4ae48aa 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,69 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestMove(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager both, assignee member", "ivy", "/projects/ops/tasks/t4/move", `{"toProjectId":"web"}`, 200},
++		{"unassigned task", "ivy", "/projects/web/tasks/t3/move", `{"toProjectId":"ops"}`, 200},
++		{"assignee not in destination", "ivy", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 400},
++		{"viewer in destination", "ann", "/projects/web/tasks/t3/move", `{"toProjectId":"ops"}`, 403},
++		{"contributor in source", "ben", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
++		{"org admin", "eve", "/projects/web/tasks/t3/move", `{"toProjectId":"ops"}`, 403},
++		{"non member of source", "hal", "/projects/web/tasks/t3/move", `{"toProjectId":"ops"}`, 404},
++		{"archived source", "ann", "/projects/legacy/tasks/t5/move", `{"toProjectId":"web"}`, 409},
++		{"archived destination", "ann", "/projects/web/tasks/t3/move", `{"toProjectId":"legacy"}`, 409},
++		{"other org destination", "ann", "/projects/web/tasks/t3/move", `{"toProjectId":"gx"}`, 404},
++		{"unknown destination", "ann", "/projects/web/tasks/t3/move", `{"toProjectId":"nope"}`, 404},
++		{"same project", "ann", "/projects/web/tasks/t3/move", `{"toProjectId":"web"}`, 400},
++		{"missing destination", "ann", "/projects/web/tasks/t3/move", `{}`, 400},
++		{"cross project id", "ivy", "/projects/web/tasks/t4/move", `{"toProjectId":"ops"}`, 404},
++		{"anonymous", "", "/projects/web/tasks/t3/move", `{"toProjectId":"ops"}`, 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveKeepsFieldsAndRelocates(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/projects/ops/tasks/t4/move", "ivy", `{"toProjectId":"web"}`)
++	if code != 200 {
++		t.Fatal(code, body)
++	}
++	var got Task
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := Task{ID: "t4", ProjectID: "web", Title: "Rotate keys", Status: "open", Assignee: "cat"}
++	if got != want {
++		t.Fatalf("got %+v want %+v", got, want)
++	}
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks/t4", "ivy", ""); code != 404 {
++		t.Fatalf("old location: got %d want 404", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks/t4", "ivy", ""); code != 200 {
++		t.Fatalf("new location: got %d want 200", code)
++	}
++}
++
++func TestMoveRejectedChangesNothing(t *testing.T) {
++	h := newServer()
++	if code, _ := do(t, h, "POST", "/projects/web/tasks/t1/move", "ivy", `{"toProjectId":"ops"}`); code != 400 {
++		t.Fatal(code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks/t1", "ivy", ""); code != 200 {
++		t.Fatalf("task should still be in web, got %d", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

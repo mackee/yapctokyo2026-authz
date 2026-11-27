@@ -1,0 +1,240 @@
+diff --git a/README.md b/README.md
+index ba637dd..22ee13e 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/tasks/{tid}/copy` | `{"toProjectId"}` → 201; copies title and assignee into a new `open` task in the target project; the source is unchanged |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Copying a task requires read access to the source (as above) and the same write rules as creating a task in the target project: the target must be readable (else 404), the user must be a `contributor` or `manager` there (else 403), and an archived target → 409. The copied assignee must be a contributor or manager of the target (else 400), and a contributor may only copy a task whose assignee is themselves (else 403). `toProjectId` must differ from the source project (400).
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 6152a73..a04ae33 100644
+--- a/main.go
++++ b/main.go
+@@ -22,6 +22,8 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - copying a task is a read of the source plus a create in the target
++//     project, so the create rules apply to the target              (see copyTask)
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -42,6 +44,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/tasks/{tid}/copy", s.copyTask)
+ 	return mux
+ }
+ 
+@@ -282,3 +285,83 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	s.store.DeleteTask(task.ID)
+ 	w.WriteHeader(204)
+ }
++
++type copyRequest struct {
++	ToProjectID string `json:"toProjectId"`
++}
++
++// copyTask creates a new open task in another project, carrying over the
++// title and assignee of the source task. The source task is left unchanged.
++func (s *server) copyTask(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	user := s.store.User(r.Header.Get("X-User"))
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project := s.store.Project(r.PathValue("pid"))
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role := s.store.Role(project.ID, user.ID)
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	task := s.store.Task(r.PathValue("tid"))
++	if task == nil || task.ProjectID != project.ID {
++		writeError(w, 404, "not found")
++		return
++	}
++	var req copyRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	if req.ToProjectID == project.ID {
++		writeError(w, 400, "toProjectId must differ from the source project")
++		return
++	}
++	// The target project is checked with the same rules as createTask.
++	target := s.store.Project(req.ToProjectID)
++	if target == nil || target.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	targetRole := s.store.Role(target.ID, user.ID)
++	if targetRole == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if targetRole != RoleManager && targetRole != RoleContributor {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if target.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	if task.Assignee != "" {
++		assigneeRole := s.store.Role(target.ID, task.Assignee)
++		if assigneeRole != RoleManager && assigneeRole != RoleContributor {
++			writeError(w, 400, "assignee must be a contributor or manager of the target project")
++			return
++		}
++		if targetRole == RoleContributor && task.Assignee != user.ID {
++			writeError(w, 403, "contributors may only assign tasks to themselves")
++			return
++		}
++	}
++	copied := &Task{
++		ID:        s.store.NewTaskID(),
++		ProjectID: target.ID,
++		Title:     task.Title,
++		Status:    "open",
++		Assignee:  task.Assignee,
++	}
++	s.store.PutTask(copied)
++	writeJSON(w, 201, copied)
++}
+diff --git a/main_test.go b/main_test.go
+index 0277f51..6400814 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,110 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestCopy(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager copies", "ivy", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 201},
++		{"contributor copies own", "cat", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 201},
++		{"unassigned copies", "ivy", "/projects/web/tasks/t3", `{"toProjectId":"ops"}`, 201},
++		{"assignee not in target", "ivy", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 400},
++		{"contributor copies task of non-target member", "cat", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 400},
++		{"viewer in target", "ann", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 403},
++		{"org admin in target", "eve", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 403},
++		{"non member source", "hal", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 404},
++		{"other org source", "gus", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 404},
++		{"other org target", "ann", "/projects/web/tasks/t3", `{"toProjectId":"gx"}`, 404},
++		{"unknown target", "ivy", "/projects/web/tasks/t3", `{"toProjectId":"nope"}`, 404},
++		{"archived target", "ann", "/projects/web/tasks/t3", `{"toProjectId":"legacy"}`, 409},
++		{"same project", "ivy", "/projects/web/tasks/t3", `{"toProjectId":"web"}`, 400},
++		{"missing toProjectId", "ivy", "/projects/web/tasks/t3", `{}`, 400},
++		{"invalid body", "ivy", "/projects/web/tasks/t3", `nope`, 400},
++		{"task in other project", "ann", "/projects/web/tasks/t4", `{"toProjectId":"ops"}`, 404},
++		{"anonymous", "", "/projects/web/tasks/t3", `{"toProjectId":"ops"}`, 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path+"/copy", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestCopyContributorCannotCopyUnassignableTask(t *testing.T) {
++	srv := newServer()
++	// ivy (manager in web and ops) is assigned a task in web.
++	code, body := do(t, srv, "POST", "/projects/web/tasks", "ann", `{"title":"for ivy","assignee":"ivy"}`)
++	if code != 201 {
++		t.Fatalf("setup: got %d %s", code, body)
++	}
++	var created Task
++	json.Unmarshal([]byte(body), &created)
++
++	// cat is a contributor in ops; copying a task assigned to ivy would
++	// assign it to someone else, which contributors may not do.
++	code, _ = do(t, srv, "POST", "/projects/web/tasks/"+created.ID+"/copy", "cat", `{"toProjectId":"ops"}`)
++	if code != 403 {
++		t.Fatalf("contributor copy to other assignee: got %d want 403", code)
++	}
++	code, _ = do(t, srv, "POST", "/projects/web/tasks/"+created.ID+"/copy", "ivy", `{"toProjectId":"ops"}`)
++	if code != 201 {
++		t.Fatalf("manager copy: got %d want 201", code)
++	}
++}
++
++func TestCopyCreatesNewOpenTaskAndKeepsSource(t *testing.T) {
++	srv := newServer()
++	code, body := do(t, srv, "POST", "/projects/web/tasks/t2/copy", "ivy", `{"toProjectId":"ops"}`)
++	if code != 201 {
++		t.Fatalf("got %d %s", code, body)
++	}
++	var copied Task
++	if err := json.Unmarshal([]byte(body), &copied); err != nil {
++		t.Fatal(err)
++	}
++	if copied.ID == "" || copied.ID == "t2" {
++		t.Fatalf("want a new ID, got %q", copied.ID)
++	}
++	if copied.ProjectID != "ops" {
++		t.Fatalf("projectId = %q want ops", copied.ProjectID)
++	}
++	if copied.Title != "Update footer" {
++		t.Fatalf("title = %q", copied.Title)
++	}
++	if copied.Assignee != "cat" {
++		t.Fatalf("assignee = %q want cat", copied.Assignee)
++	}
++	if copied.Status != "open" {
++		t.Fatalf("status = %q want open (source is doing)", copied.Status)
++	}
++
++	// The copy is visible in the target project.
++	if code, _ := do(t, srv, "GET", "/projects/ops/tasks/"+copied.ID, "ivy", ""); code != 200 {
++		t.Fatalf("copy not readable in target: %d", code)
++	}
++	// The source is unchanged.
++	code, body = do(t, srv, "GET", "/projects/web/tasks/t2", "ivy", "")
++	if code != 200 {
++		t.Fatalf("source get: %d", code)
++	}
++	var src Task
++	json.Unmarshal([]byte(body), &src)
++	if src.ProjectID != "web" || src.Status != "doing" || src.Assignee != "cat" || src.Title != "Update footer" {
++		t.Fatalf("source changed: %+v", src)
++	}
++	// Target now has its seeded task plus the copy.
++	code, body = do(t, srv, "GET", "/projects/ops/tasks", "ivy", "")
++	var tasks []Task
++	json.Unmarshal([]byte(body), &tasks)
++	if code != 200 || len(tasks) != 2 {
++		t.Fatalf("ops tasks: code %d, got %d", code, len(tasks))
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

@@ -1,0 +1,1 @@
+- `/Users/Shared/quint/bin/quint` (Quint) is also permitted, by that absolute path, for example `/Users/Shared/quint/bin/quint typecheck spec/taskboard.qnt`, `/Users/Shared/quint/bin/quint test spec/taskboard.qnt` and `/Users/Shared/quint/bin/quint run spec/taskboard.qnt --invariant=invariants --max-steps=20 --max-samples=2000`.

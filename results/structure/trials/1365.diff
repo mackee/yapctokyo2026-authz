@@ -1,0 +1,347 @@
+diff --git a/README.md b/README.md
+index 49b55af..fd2c84d 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,12 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members/{uid}/move` | `{"toProjectId"}` → 200 `{"userId","projectId","role"}` |
++
++Moving a member removes them from `{pid}`, adds them to the target with the same
++role, and unassigns their tasks in `{pid}`. The caller must be a manager of both
++projects (403 otherwise); unreadable target → 404, same project → 400, archived
++source or target → 409, user already in the target → 409.
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+diff --git a/main.go b/main.go
+index 647c0d2..5bddbcd 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/members/{uid}/move", s.moveMember)
+ 	return mux
+ }
+ 
+diff --git a/move.go b/move.go
+new file mode 100644
+index 0000000..6c6c737
+--- /dev/null
++++ b/move.go
+@@ -0,0 +1,131 @@
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++)
++
++type moveRequest struct {
++	ToProjectID string `json:"toProjectId"`
++}
++
++// canReadProject reports whether user may read project p (same org, and a member or org admin).
++func (s *server) canReadProject(r *http.Request, u *user, p *project) (role string, ok bool, err error) {
++	if p == nil || p.OrgID != u.OrgID {
++		return "", false, nil
++	}
++	role, err = findRole(r.Context(), s.db, p.ID, u.ID)
++	if err != nil {
++		return "", false, err
++	}
++	return role, role != "" || u.OrgAdmin, nil
++}
++
++// moveMember: POST /projects/{pid}/members/{uid}/move {"toProjectId"}
++// Mirrors moveOutcome/moveMember in spec/taskboard.qnt. The caller must be a
++// manager of both projects. The member keeps their role in the target project,
++// and tasks of the source project assigned to them become unassigned.
++func (s *server) moveMember(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	caller, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if caller == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	src, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	srcRole, ok, err := s.canReadProject(r, caller, src)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if !ok {
++		writeError(w, 404, "not found")
++		return
++	}
++	memberID := r.PathValue("uid")
++	memberRole, err := findRole(ctx, s.db, src.ID, memberID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if memberRole == "" {
++		writeError(w, 404, "not found")
++		return
++	}
++	if srcRole != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	var req moveRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	dst, err := findProject(ctx, s.db, req.ToProjectID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	dstRole, ok, err := s.canReadProject(r, caller, dst)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if !ok {
++		writeError(w, 404, "not found")
++		return
++	}
++	if dstRole != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if dst.ID == src.ID {
++		writeError(w, 400, "target project must differ from the source project")
++		return
++	}
++	if src.Archived || dst.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	// Re-check inside the transaction that the member is not already in the target.
++	var n int
++	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM memberships WHERE project_id = ? AND user_id = ?`, dst.ID, memberID).Scan(&n); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if n > 0 {
++		writeError(w, 409, "user is already a member of the target project")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, src.ID, memberID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `INSERT INTO memberships (project_id, user_id, role) VALUES (?, ?, ?)`, dst.ID, memberID, memberRole); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET assignee = '' WHERE project_id = ? AND assignee = ?`, src.ID, memberID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, map[string]string{"userId": memberID, "projectId": dst.ID, "role": memberRole})
++}
+diff --git a/move_test.go b/move_test.go
+new file mode 100644
+index 0000000..181dccb
+--- /dev/null
++++ b/move_test.go
+@@ -0,0 +1,92 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestMoveMemberStatuses(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"no user", "", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 401},
++		{"unknown user", "nobody", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 401},
++		{"caller cannot read source", "hal", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 404},
++		{"other org caller", "gus", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 404},
++		{"missing source", "ivy", "/projects/nope/members/ben/move", `{"toProjectId":"ops"}`, 404},
++		{"user not a member", "ivy", "/projects/web/members/hal/move", `{"toProjectId":"ops"}`, 404},
++		{"contributor caller", "ben", "/projects/web/members/cat/move", `{"toProjectId":"ops"}`, 403},
++		{"org admin caller", "eve", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"bad body", "ivy", "/projects/web/members/ben/move", `{}`, 400},
++		{"missing target", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"nope"}`, 404},
++		{"other org target", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"gx"}`, 404},
++		{"caller not manager of target", "ann", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"same project", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"web"}`, 400},
++		{"archived target", "ann", "/projects/web/members/ben/move", `{"toProjectId":"legacy"}`, 409},
++		{"archived source", "ann", "/projects/legacy/members/ben/move", `{"toProjectId":"web"}`, 409},
++		{"already member of target", "ivy", "/projects/web/members/cat/move", `{"toProjectId":"ops"}`, 409},
++		{"ok", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 200},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			h := newServer()
++			if got, body := do(t, h, "POST", c.path, c.user, c.body); got != c.want {
++				t.Fatalf("got %d, want %d: %s", got, c.want, body)
++			}
++		})
++	}
++}
++
++func TestMoveMemberEffects(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var resp map[string]string
++	if err := json.Unmarshal([]byte(body), &resp); err != nil {
++		t.Fatal(err)
++	}
++	if resp["userId"] != "ben" || resp["projectId"] != "ops" || resp["role"] != "contributor" {
++		t.Fatalf("unexpected response: %v", resp)
++	}
++	// ben is no longer a web member and can read ops.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("ben should lose web, got %d", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks", "ben", ""); code != 200 {
++		t.Fatalf("ben should read ops, got %d", code)
++	}
++	// ben's web task t1 is now unassigned (assignees must be writers of the project).
++	_, body = do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
++	var task Task
++	if err := json.Unmarshal([]byte(body), &task); err != nil {
++		t.Fatal(err)
++	}
++	if task.Assignee != "" {
++		t.Fatalf("t1 assignee = %q, want unassigned", task.Assignee)
++	}
++	// Moving again from web fails: ben is no longer a member there.
++	if code, _ := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`); code != 404 {
++		t.Fatalf("second move got %d, want 404", code)
++	}
++}
++
++func TestMoveMemberRejectedChangesNothing(t *testing.T) {
++	h := newServer()
++	if code, _ := do(t, h, "POST", "/projects/web/members/cat/move", "ivy", `{"toProjectId":"ops"}`); code != 409 {
++		t.Fatalf("got %d, want 409", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "cat", ""); code != 200 {
++		t.Fatalf("cat should stay in web, got %d", code)
++	}
++	_, body := do(t, h, "GET", "/projects/web/tasks/t2", "ann", "")
++	var task Task
++	if err := json.Unmarshal([]byte(body), &task); err != nil {
++		t.Fatal(err)
++	}
++	if task.Assignee != "cat" {
++		t.Fatalf("t2 assignee = %q, want cat", task.Assignee)
++	}
++}
+diff --git a/spec/taskboard.qnt b/spec/taskboard.qnt
+index fe78764..a80c460 100644
+--- a/spec/taskboard.qnt
++++ b/spec/taskboard.qnt
+@@ -123,6 +123,20 @@ module taskboard {
+     else if (projects.get(p).archived) 409
+     else 204
+ 
++  // POST /projects/{p}/members/{m}/move {"toProjectId": q}
++  // Caller u must be a manager of both the source p and the target q.
++  def moveOutcome(u: UserId, p: ProjectId, m: UserId, q: ProjectId): int =
++    if (not(userExists(u))) 401
++    else if (not(canRead(u, p))) 404
++    else if (roleOf(p, m) == "") 404
++    else if (roleOf(p, u) != "manager") 403
++    else if (not(canRead(u, q))) 404
++    else if (roleOf(q, u) != "manager") 403
++    else if (p == q) 400
++    else if (projects.get(p).archived or projects.get(q).archived) 409
++    else if (roleOf(q, m) != "") 409
++    else 200
++
+   // ---- actions -------------------------------------------------------------
+ 
+   action unchanged = all {
+@@ -164,6 +178,21 @@ module taskboard {
+       members' = members,
+     } else unchanged
+ 
++  // The member leaves p and joins q with the same role. Tasks of p assigned to
++  // the member become unassigned (the member is no longer a writer of p).
++  action moveMember(u: UserId, p: ProjectId, m: UserId, q: ProjectId): bool =
++    if (moveOutcome(u, p, m, q) == 200) all {
++      members' = members.keys().exclude(Set((p, m))).mapBy(k => members.get(k))
++        .put((q, m), members.get((p, m))),
++      tasks' = tasks.keys().mapBy(k =>
++        if (tasks.get(k).project == p and tasks.get(k).assignee == m)
++          { ...tasks.get(k), assignee: "" }
++        else tasks.get(k)),
++      nextTask' = nextTask,
++      users' = users,
++      projects' = projects,
++    } else unchanged
++
+   // ---- seed data and steps -------------------------------------------------
+ 
+   action init = all {
+@@ -202,7 +231,9 @@ module taskboard {
+     nondet t = 1.to(nextTask).oneOf()
+     nondet s = STATUSES.oneOf()
+     nondet changeAssignee = Set(true, false).oneOf()
++    nondet q = PROJECTS.oneOf()
+     any {
++      moveMember(u, p, a, q),
+       createTask(u, p, a),
+       updateTask(u, p, t, s, changeAssignee, a),
+       deleteTask(u, p, t),
+@@ -230,6 +261,25 @@ module taskboard {
+       assert(deleteOutcome("ann", "web", 1) == 204),
+       assert(deleteOutcome("ben", "web", 1) == 403),
+       assert(deleteOutcome("ann", "web", 4) == 404),
++      assert(moveOutcome("ivy", "web", "ben", "ops") == 200),
++      assert(moveOutcome("ivy", "web", "ann", "ops") == 409),
++      assert(moveOutcome("ivy", "web", "ben", "web") == 400),
++      assert(moveOutcome("ivy", "web", "hal", "ops") == 404),
++      assert(moveOutcome("ben", "web", "cat", "ops") == 403),
++      assert(moveOutcome("ann", "web", "ben", "ops") == 403),
++      assert(moveOutcome("ivy", "web", "ben", "legacy") == 404),
++      assert(moveOutcome("ann", "legacy", "ben", "web") == 409),
++      assert(moveOutcome("ivy", "web", "ben", "gx") == 404),
++      unchanged,
++    })
++
++  // Moving ben out of web unassigns his tasks there and keeps his role.
++  run moveTest =
++    init.then(moveMember("ivy", "web", "ben", "ops")).then(all {
++      assert(roleOf("web", "ben") == ""),
++      assert(roleOf("ops", "ben") == "contributor"),
++      assert(tasks.get(1).assignee == ""),
++      assert(invariants),
+       unchanged,
+     })
+ }

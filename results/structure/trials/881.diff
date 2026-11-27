@@ -1,0 +1,215 @@
+diff --git a/main.go b/main.go
+index 647c0d2..0db172c 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/members/{uid}/move", s.moveMember)
+ 	return mux
+ }
+ 
+@@ -405,6 +406,134 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, 200, task)
+ }
+ 
++type moveRequest struct {
++	ToProjectID string `json:"toProjectId"`
++}
++
++type moveResponse struct {
++	UserID    string `json:"userId"`
++	ProjectID string `json:"projectId"`
++	Role      string `json:"role"`
++}
++
++// moveMember moves a member from the path project to another project, keeping
++// their role. The caller must be a manager of both projects. Tasks assigned to
++// the moved user in the source project become unassigned.
++func (s *server) moveMember(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	src, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if src == nil || src.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	srcRole, err := findRole(ctx, s.db, src.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if srcRole == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if srcRole != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	var req moveRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	dst, err := findProject(ctx, s.db, req.ToProjectID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if dst == nil || dst.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	dstRole, err := findRole(ctx, s.db, dst.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if dstRole == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if dstRole != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if src.Archived || dst.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	if src.ID == dst.ID {
++		writeError(w, 400, "source and destination must differ")
++		return
++	}
++	uid := r.PathValue("uid")
++
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	var role string
++	err = tx.QueryRowContext(ctx, `SELECT role FROM memberships WHERE project_id = ? AND user_id = ?`, src.ID, uid).Scan(&role)
++	if errors.Is(err, sql.ErrNoRows) {
++		writeError(w, 404, "not found")
++		return
++	}
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	var exists int
++	err = tx.QueryRowContext(ctx, `SELECT 1 FROM memberships WHERE project_id = ? AND user_id = ?`, dst.ID, uid).Scan(&exists)
++	if err == nil {
++		writeError(w, 409, "user is already a member of the destination project")
++		return
++	}
++	if !errors.Is(err, sql.ErrNoRows) {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, src.ID, uid); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET assignee = '' WHERE project_id = ? AND assignee = ?`, src.ID, uid); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `INSERT INTO memberships (project_id, user_id, role) VALUES (?, ?, ?)`, dst.ID, uid, role); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, moveResponse{UserID: uid, ProjectID: dst.ID, Role: role})
++}
++
+ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	ctx := r.Context()
+ 	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
+diff --git a/main_test.go b/main_test.go
+index 5c16a74..5d12c67 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,63 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestMoveMember(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager of both", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 200},
++		{"manager of source, viewer of dest", "ann", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"manager of source, non member of dest", "ann", "/projects/web/members/ben/move", `{"toProjectId":"gx"}`, 404},
++		{"contributor caller", "ben", "/projects/web/members/cat/move", `{"toProjectId":"ops"}`, 403},
++		{"org admin", "eve", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"non member caller", "hal", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 404},
++		{"anonymous", "", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 401},
++		{"already in dest", "ivy", "/projects/web/members/cat/move", `{"toProjectId":"ops"}`, 409},
++		{"not a member of source", "ivy", "/projects/web/members/hal/move", `{"toProjectId":"ops"}`, 404},
++		{"archived dest", "ann", "/projects/web/members/ben/move", `{"toProjectId":"legacy"}`, 409},
++		{"other org dest", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"gx"}`, 404},
++		{"missing dest", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"nope"}`, 404},
++		{"same project", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"web"}`, 400},
++		{"bad body", "ivy", "/projects/web/members/ben/move", `{}`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveMemberEffects(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var resp moveResponse
++	json.Unmarshal([]byte(body), &resp)
++	if resp != (moveResponse{UserID: "ben", ProjectID: "ops", Role: "contributor"}) {
++		t.Fatalf("bad response %+v", resp)
++	}
++	// ben is gone from web, present in ops
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("ben still sees web: %d", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks", "ben", ""); code != 200 {
++		t.Fatalf("ben cannot see ops: %d", code)
++	}
++	// his task in web is unassigned
++	_, body = do(t, h, "GET", "/projects/web/tasks/t1", "ivy", "")
++	var task Task
++	json.Unmarshal([]byte(body), &task)
++	if task.Assignee != "" {
++		t.Fatalf("assignee not cleared: %q", task.Assignee)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

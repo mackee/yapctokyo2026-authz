@@ -1,0 +1,264 @@
+diff --git a/README.md b/README.md
+index 3fe8794..0a1234d 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/tasks/{tid}/move` | `{"toProjectId"}` → 200 with the moved task |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`. Request
+ bodies are JSON (`Content-Type: application/json`).
+@@ -35,6 +36,11 @@ bodies are JSON (`Content-Type: application/json`).
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Moving a task requires the manager role in its project and the contributor or
++  manager role in the destination. The destination must exist and be readable
++  by the user (else 404) and must differ from the current project. The task
++  keeps its ID, title, status and assignee; if the assignee is not a
++  contributor or manager of the destination, the move is rejected with 400.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/internal/model/aggregate.go b/internal/model/aggregate.go
+index e558654..496a29f 100644
+--- a/internal/model/aggregate.go
++++ b/internal/model/aggregate.go
+@@ -126,6 +126,56 @@ func (a *updateTaskAggregate) apply(ctx context.Context, tx DB) (*Task, error) {
+ 	return t, nil
+ }
+ 
++// moveTaskAggregate moves one task to another project, keeping its assignee.
++type moveTaskAggregate struct {
++	task     *Task
++	dest     *Project
++	assignee *Membership // dest.Membership(task assignee); nil when unassigned
++}
++
++func loadMoveTask(ctx context.Context, tx DB, taskID, destID string) (*moveTaskAggregate, error) {
++	t, err := NewTaskTable().Find(ctx, tx, taskID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	dest, err := NewProjectTable().Find(ctx, tx, destID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrInvalid, "task must belong to an existing project")
++	} else if err != nil {
++		return nil, err
++	}
++	a := &moveTaskAggregate{task: t, dest: dest}
++	if t.AssigneeID != "" {
++		m, err := dest.Membership(ctx, tx, t.AssigneeID)
++		if errors.Is(err, ErrNoRows) {
++			return nil, deny(ErrInvalid, "assignee must be a contributor or manager of the project")
++		} else if err != nil {
++			return nil, err
++		}
++		a.assignee = m
++	}
++	return a, nil
++}
++
++func (a *moveTaskAggregate) validate() error {
++	if a.task.ProjectID == a.dest.ID {
++		return deny(ErrInvalid, "task is already in the project")
++	}
++	if a.assignee != nil && !isWriterRole(a.assignee.Role) {
++		return deny(ErrInvalid, "assignee must be a contributor or manager of the project")
++	}
++	return nil
++}
++
++func (a *moveTaskAggregate) apply(ctx context.Context, tx DB) (*Task, error) {
++	if err := a.task.moveTo(ctx, tx, a.dest); err != nil {
++		return nil, err
++	}
++	return a.task, nil
++}
++
+ // deleteTaskAggregate removes one task.
+ type deleteTaskAggregate struct {
+ 	task *Task
+diff --git a/internal/model/authz.go b/internal/model/authz.go
+index 89224a1..ec0da79 100644
+--- a/internal/model/authz.go
++++ b/internal/model/authz.go
+@@ -121,6 +121,16 @@ func (a TaskAuthz) CanManage() error {
+ 	return nil
+ }
+ 
++// CanMove returns nil if the actor may move the task to the project dest:
++// the actor may manage the task (it leaves its project, like a delete) and
++// may create tasks in dest (contributor or manager, not archived).
++func (a TaskAuthz) CanMove(dest ProjectAuthz) error {
++	if err := a.CanManage(); err != nil {
++		return err
++	}
++	return dest.CanWrite()
++}
++
+ // ---- building authorization objects -------------------------------------------------
+ 
+ // Authenticate resolves the X-User value. Unknown or missing users are 401.
+diff --git a/internal/model/record.go b/internal/model/record.go
+index b23b291..0b356b3 100644
+--- a/internal/model/record.go
++++ b/internal/model/record.go
+@@ -153,6 +153,12 @@ func (r *Task) unassign(ctx context.Context, db DB) error {
+ 	return r.save(ctx, db)
+ }
+ 
++// moveTo moves the task to the project, keeping everything else.
++func (r *Task) moveTo(ctx context.Context, db DB, p *Project) error {
++	r.ProjectID = p.ID
++	return r.save(ctx, db)
++}
++
+ // destroy deletes the task.
+ func (r *Task) destroy(ctx context.Context, db DB) error {
+ 	if _, err := db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, r.ID); err != nil {
+diff --git a/internal/model/task_table.go b/internal/model/task_table.go
+index 5ac0b03..b5eb0dc 100644
+--- a/internal/model/task_table.go
++++ b/internal/model/task_table.go
+@@ -167,6 +167,35 @@ func (*TaskTable) Update(ctx context.Context, db DB, authz TaskAuthz, in TaskTab
+ 	return t, nil
+ }
+ 
++// Move moves the task to the project dest, all or nothing. The task keeps its
++// ID, title, status and assignee; the assignee must be a contributor or
++// manager of dest.
++func (*TaskTable) Move(ctx context.Context, db DB, authz TaskAuthz, dest ProjectAuthz) (*Task, error) {
++	if !dest.CanRead() {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	if err := authz.CanMove(dest); err != nil {
++		return nil, err
++	}
++	var t *Task
++	if err := inTx(ctx, db, func(tx DB) error {
++		agg, err := loadMoveTask(ctx, tx, authz.TaskID(), dest.ProjectID())
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		if t, err = agg.apply(ctx, tx); err != nil {
++			return err
++		}
++		return nil
++	}); err != nil {
++		return nil, err
++	}
++	return t, nil
++}
++
+ // Delete deletes the task.
+ func (*TaskTable) Delete(ctx context.Context, db DB, authz TaskAuthz) error {
+ 	if err := authz.CanManage(); err != nil {
+diff --git a/main.go b/main.go
+index cfe3d30..a845a89 100644
+--- a/main.go
++++ b/main.go
+@@ -82,6 +82,7 @@ func newServer() http.Handler {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+ 			tr.Patch("/", tanukirpc.NewHandler(updateTask))
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
++			tr.Post("/move", tanukirpc.NewHandler(moveTask))
+ 		})
+ 	})
+ 	return &appHandler{Handler: r, db: conn}
+@@ -161,6 +162,26 @@ func updateTask(ctx tanukirpc.Context[*taskRegistry], req updateRequest) (*Task,
+ 	return model.NewTaskTable().Update(ctx, reg.db, reg.authz, model.TaskTableUpdateInput{Title: req.Title, Status: req.Status, Assignee: req.Assignee})
+ }
+ 
++type moveRequest struct {
++	ToProjectID string `json:"toProjectId" validate:"required"`
++}
++
++// moveTask builds the actor's authorization object for the destination project
++// (an unreadable or missing one is 404), then moves the task.
++func moveTask(ctx tanukirpc.Context[*taskRegistry], req moveRequest) (*Task, error) {
++	reg := ctx.Registry()
++	// The actor's right to move the task out comes before anything about the
++	// destination, so a caller who may not move it learns nothing about it.
++	if err := reg.authz.CanManage(); err != nil {
++		return nil, err
++	}
++	dest, err := model.NewProjectAuthz(ctx, reg.db, reg.authz.Project().Actor(), req.ToProjectID)
++	if err != nil {
++		return nil, err
++	}
++	return model.NewTaskTable().Move(ctx, reg.db, reg.authz, dest)
++}
++
+ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, error) {
+ 	reg := ctx.Registry()
+ 	if err := model.NewTaskTable().Delete(ctx, reg.db, reg.authz); err != nil {
+diff --git a/main_test.go b/main_test.go
+index 190ea41..2936bc7 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -119,6 +119,57 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestMove(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager unassigned", "ivy", "/projects/web/tasks/t3/move", `{"toProjectId":"ops"}`, 200},
++		{"manager assignee is member of dest", "ivy", "/projects/ops/tasks/t4/move", `{"toProjectId":"web"}`, 200},
++		{"assignee not in dest", "ivy", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 400},
++		{"same project", "ivy", "/projects/web/tasks/t3/move", `{"toProjectId":"web"}`, 400},
++		{"missing body field", "ivy", "/projects/web/tasks/t3/move", `{}`, 400},
++		{"contributor", "ben", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
++		{"viewer in dest", "ann", "/projects/web/tasks/t3/move", `{"toProjectId":"ops"}`, 403},
++		{"dest archived", "ann", "/projects/web/tasks/t3/move", `{"toProjectId":"legacy"}`, 409},
++		{"source archived", "ann", "/projects/legacy/tasks/t5/move", `{"toProjectId":"web"}`, 409},
++		{"dest missing", "ivy", "/projects/web/tasks/t3/move", `{"toProjectId":"nope"}`, 404},
++		{"dest other org", "ivy", "/projects/web/tasks/t3/move", `{"toProjectId":"gx"}`, 404},
++		{"cross project task", "ivy", "/projects/web/tasks/t4/move", `{"toProjectId":"ops"}`, 404},
++		{"unauthenticated", "", "/projects/web/tasks/t3/move", `{"toProjectId":"ops"}`, 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveKeepsTask(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/projects/ops/tasks/t4/move", "ivy", `{"toProjectId":"web"}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var got Task
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := Task{ID: "t4", ProjectID: "web", Title: "Rotate keys", Status: "open", AssigneeID: "cat"}
++	if got != want {
++		t.Fatalf("got %+v want %+v", got, want)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks/t4", "ivy", ""); code != 200 {
++		t.Fatalf("task not in web after move: %d", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks/t4", "ivy", ""); code != 404 {
++		t.Fatalf("task still in ops after move: %d", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

@@ -1,0 +1,159 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..734370f 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,11 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| DELETE | `/orgs/{orgID}/users/{uid}` | offboarding: removes the user from all projects of the org → 204 |
++
++Removing a user also unassigns their tasks in those projects (archived ones too). Only
++org admins of the org may call it (other members → 403, other orgs → 404); a target
++user who does not exist in the org → 404. The user record itself is kept.
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+diff --git a/main.go b/main.go
+index a75fde4..4aa18e0 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("DELETE /orgs/{orgID}/users/{uid}", s.removeOrgUser)
+ 	return &appHandler{Handler: mux, db: db}
+ }
+ 
+@@ -412,6 +413,63 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, 200, task)
+ }
+ 
++// removeOrgUser removes a user from every project of the organization (offboarding).
++// Only org admins of that organization may do it. The user's tasks in those projects
++// are unassigned, because an assignee must be a contributor or manager of the project.
++// This also applies to archived projects: it is cleanup of the departing user's data,
++// not a write by a project member.
++func (s *server) removeOrgUser(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	caller, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if caller == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	orgID := r.PathValue("orgID")
++	if caller.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if !caller.OrgAdmin {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	target, err := findUser(ctx, s.db, r.PathValue("uid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if target == nil || target.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET assignee = ''
++		WHERE assignee = ? AND project_id IN (SELECT id FROM projects WHERE org_id = ?)`, target.ID, orgID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `DELETE FROM memberships
++		WHERE user_id = ? AND project_id IN (SELECT id FROM projects WHERE org_id = ?)`, target.ID, orgID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	w.WriteHeader(204)
++}
++
+ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	ctx := r.Context()
+ 	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
+diff --git a/main_test.go b/main_test.go
+index 5d0aab5..a3ff0b9 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -116,6 +116,62 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestRemoveOrgUser(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"org admin", "eve", "/orgs/acme/users/ben", 204},
++		{"org admin no memberships", "eve", "/orgs/acme/users/hal", 204},
++		{"manager not org admin", "ann", "/orgs/acme/users/ben", 403},
++		{"anonymous", "", "/orgs/acme/users/ben", 401},
++		{"other org admin", "gus", "/orgs/acme/users/ben", 404},
++		{"unknown target", "eve", "/orgs/acme/users/zed", 404},
++		{"target in other org", "eve", "/orgs/acme/users/gus", 404},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveOrgUserEffects(t *testing.T) {
++	h := newServer()
++	if code, _ := do(t, h, "DELETE", "/orgs/acme/users/ben", "eve", ""); code != 204 {
++		t.Fatal(code)
++	}
++	// ben is gone from every project, including the archived one.
++	for _, p := range []string{"web", "legacy"} {
++		if code, _ := do(t, h, "GET", "/projects/"+p+"/tasks", "ben", ""); code != 404 {
++			t.Fatalf("ben still reads %s: %d", p, code)
++		}
++	}
++	// ben's tasks are unassigned; other users are untouched.
++	for id, want := range map[string]string{"t1": "", "t5": "", "t2": "cat"} {
++		p := "web"
++		if id == "t5" {
++			p = "legacy"
++		}
++		_, body := do(t, h, "GET", "/projects/"+p+"/tasks/"+id, "ann", "")
++		var task Task
++		json.Unmarshal([]byte(body), &task)
++		if task.Assignee != want {
++			t.Fatalf("task %s assignee %q want %q", id, task.Assignee, want)
++		}
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "cat", ""); code != 200 {
++		t.Fatalf("cat lost access: %d", code)
++	}
++	// Other orgs are unaffected by removal in acme.
++	if code, _ := do(t, h, "GET", "/projects/gx/tasks", "gus", ""); code != 200 {
++		t.Fatalf("gus lost access: %d", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

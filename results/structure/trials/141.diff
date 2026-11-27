@@ -1,0 +1,595 @@
+diff --git a/README.md b/README.md
+index 8d54490..6c8e9cd 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,9 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| GET | `/projects/{pid}/tasks/{tid}/comments` | list comments of a task |
++| POST | `/projects/{pid}/tasks/{tid}/comments` | `{"body"}` → 201 `{"id","taskId","author","body"}` |
++| GET | `/comments/{cid}` | one comment (e.g. the target of a notification link) |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +35,10 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Comments: any project member, viewers included, may comment on any task of
++  the project (org admins without a role get 403). Reading comments, or a single
++  comment by ID, follows the project read rule (members and org admins; otherwise
++  404). Comments are removed with their task.
+ 
+ ## Seed data
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..4d6bd57 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -58,6 +58,14 @@ type TaskView struct {
+ 	Assignee  string `json:"assignee"`
+ }
+ 
++// CommentView is the public representation of a comment.
++type CommentView struct {
++	ID     string `json:"id"`
++	TaskID string `json:"taskId"`
++	Author string `json:"author"`
++	Body   string `json:"body"`
++}
++
+ // Assignee is an assignee that has been admitted for one specific project:
+ // either nobody, or a user who is a contributor or manager of that project.
+ // It can only be obtained from WriteProject.AdmitAssignee (or ManageTask), and
+@@ -111,6 +119,7 @@ func (a *Authorizer) Authenticate(userID string) (ActorScope, error) {
+ type ActorScope interface {
+ 	Actor() Actor
+ 	Project(projectID string) ProjectScope
++	Comment(commentID string) CommentScope
+ }
+ 
+ // ProjectScope is bound to one actor and one project ID. It grants nothing by
+@@ -128,6 +137,12 @@ type TaskScope interface {
+ 	Read() (ReadTask, error)
+ 	Edit() (EditTask, error)
+ 	Manage() (ManageTask, error)
++	Comment() (CommentTask, error)
++}
++
++// CommentScope is bound to one actor and one comment ID.
++type CommentScope interface {
++	Read() (ReadComment, error)
+ }
+ 
+ type actorScope struct {
+@@ -139,6 +154,9 @@ func (s *actorScope) Actor() Actor { return s.actor }
+ func (s *actorScope) Project(projectID string) ProjectScope {
+ 	return &projectScope{as: s, pid: projectID}
+ }
++func (s *actorScope) Comment(commentID string) CommentScope {
++	return &commentScope{as: s, cid: commentID}
++}
+ 
+ type projectScope struct {
+ 	as  *actorScope
+@@ -277,9 +295,10 @@ func (p *writeProject) CreateTask(title string, assignee Assignee) (TaskView, er
+ 
+ // ---- task capabilities ---------------------------------------------------------
+ 
+-// ReadTask may read one task.
++// ReadTask may read one task and the comments on it.
+ type ReadTask interface {
+ 	View() TaskView
++	Comments() []CommentView
+ }
+ 
+ // TaskPatch is a partial update. Nil fields are left unchanged.
+@@ -386,6 +405,12 @@ func (t *readTask) View() TaskView {
+ 	return v
+ }
+ 
++func (t *readTask) Comments() []CommentView {
++	var out []CommentView
++	_ = t.ts.ps.as.a.st.read(func(s *state) error { out = s.commentsOn(t.ts.tid); return nil })
++	return out
++}
++
+ type editTask struct {
+ 	readTask
+ 	role string
+@@ -429,6 +454,12 @@ type manageTask struct{ editTask }
+ func (t *manageTask) Delete() error {
+ 	return t.ts.ps.as.a.st.tx(func(s *state) error {
+ 		delete(s.tasks, t.ts.tid)
++		// Comments belong to their task; drop them with it.
++		for id, c := range s.comments {
++			if c.task == t.ts.tid {
++				delete(s.comments, id)
++			}
++		}
+ 		return nil
+ 	})
+ }
+diff --git a/internal/capability/comment.go b/internal/capability/comment.go
+new file mode 100644
+index 0000000..fcb67e9
+--- /dev/null
++++ b/internal/capability/comment.go
+@@ -0,0 +1,108 @@
++package capability
++
++// Comments are attached to tasks. Access rules:
++//
++//   - reading a comment, or the comments of a task, follows the task read rule
++//     (members and org admins; otherwise 404)
++//   - adding a comment needs any project role, viewers included (non-members
++//     are 404 because the project is not readable to them; org admins without a
++//     role are 403); archived projects reject it with 409
++
++// CommentTask may add comments to one task (and read them, via ReadTask).
++type CommentTask interface {
++	ReadTask
++	// AddComment appends a comment authored by the actor. An empty body is 400.
++	AddComment(body string) (CommentView, error)
++}
++
++// ReadComment may read one comment.
++type ReadComment interface {
++	View() CommentView
++}
++
++// Comment acquires the capability to comment on this task.
++func (s *taskScope) Comment() (CommentTask, error) {
++	err := s.ps.as.a.st.read(func(st *state) error {
++		p, r, _, err := locate(st, s.ps.as.actor, s.ps.pid, s.tid)
++		if err != nil {
++			return err
++		}
++		if r == "" {
++			return deny(ErrForbidden, "forbidden")
++		}
++		if p.archived {
++			return deny(ErrArchived, "project is archived")
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &commentTask{readTask{ts: s}}, nil
++}
++
++type commentTask struct {
++	readTask
++}
++
++func (t *commentTask) AddComment(body string) (CommentView, error) {
++	if body == "" {
++		return CommentView{}, deny(ErrInvalid, "comment body must not be empty")
++	}
++	var v CommentView
++	err := t.ts.ps.as.a.st.tx(func(s *state) error {
++		// Re-check under the write lock: the task may have been deleted since
++		// the capability was acquired.
++		tk, ok := s.tasks[t.ts.tid]
++		if !ok || tk.project != t.ts.ps.pid {
++			return deny(ErrNotFound, "not found")
++		}
++		id, seq := s.newCommentID()
++		c := comment{
++			id:      id,
++			seq:     seq,
++			task:    t.ts.tid,
++			project: t.ts.ps.pid,
++			author:  t.ts.ps.as.actor.id,
++			body:    body,
++		}
++		s.comments[c.id] = c
++		v = c.view()
++		return nil
++	})
++	return v, err
++}
++
++// commentScope is bound to one actor and one comment ID.
++type commentScope struct {
++	as  *actorScope
++	cid string
++}
++
++// Read applies the task read rule through the comment's project: the project
++// must be readable by the actor, otherwise 404 (as is an unknown comment).
++func (s *commentScope) Read() (ReadComment, error) {
++	var v CommentView
++	err := s.as.a.st.read(func(st *state) error {
++		c, ok := st.comments[s.cid]
++		if !ok {
++			return deny(ErrNotFound, "not found")
++		}
++		if _, _, err := readable(st, s.as.actor, c.project); err != nil {
++			return err
++		}
++		v = c.view()
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &readComment{v: v}, nil
++}
++
++// readComment holds the view captured when the capability was acquired.
++type readComment struct {
++	v CommentView
++}
++
++func (c *readComment) View() CommentView { return c.v }
+diff --git a/internal/capability/state.go b/internal/capability/state.go
+index 57a31af..01a8c68 100644
+--- a/internal/capability/state.go
++++ b/internal/capability/state.go
+@@ -33,12 +33,23 @@ type task struct {
+ 	assignee Assignee // bound to task.project; see Assignee
+ }
+ 
++type comment struct {
++	id      string
++	seq     int // numeric part of id, used for ordering
++	task    string
++	project string // the task's project, copied so access can be checked directly
++	author  string
++	body    string
++}
++
+ type state struct {
+ 	users    map[string]user
+ 	projects map[string]project
+ 	members  map[string]map[string]string // projectID -> userID -> role
+ 	tasks    map[string]task              // task IDs are unique across all projects
++	comments map[string]comment           // comment IDs are unique across all tasks
+ 	nextID   int
++	nextCID  int
+ }
+ 
+ func (s *state) role(projectID, userID string) string { return s.members[projectID][userID] }
+@@ -51,7 +62,12 @@ func (s *state) clone() *state {
+ 		projects: make(map[string]project, len(s.projects)),
+ 		members:  make(map[string]map[string]string, len(s.members)),
+ 		tasks:    make(map[string]task, len(s.tasks)),
++		comments: make(map[string]comment, len(s.comments)),
+ 		nextID:   s.nextID,
++		nextCID:  s.nextCID,
++	}
++	for k, v := range s.comments {
++		n.comments[k] = v
+ 	}
+ 	for k, v := range s.users {
+ 		n.users[k] = v
+@@ -78,6 +94,8 @@ func (s *state) clone() *state {
+ //   - a task's Assignee is bound to the task's own project
+ //   - an assignee is always a contributor or manager of the task's project
+ //   - project members are users of the project's organization, with a valid role
++//   - every comment belongs to an existing task of its project, and its author
++//     is a member (any role) of that project
+ func (s *state) check() error {
+ 	for pid, m := range s.members {
+ 		p, ok := s.projects[pid]
+@@ -108,9 +126,37 @@ func (s *state) check() error {
+ 			}
+ 		}
+ 	}
++	for _, c := range s.comments {
++		t, ok := s.tasks[c.task]
++		if !ok {
++			return deny(ErrInvalid, fmt.Sprintf("comment %s belongs to an unknown task", c.id))
++		}
++		if t.project != c.project {
++			return deny(ErrInvalid, fmt.Sprintf("comment %s: project does not match its task", c.id))
++		}
++		if s.role(c.project, c.author) == "" {
++			return deny(ErrInvalid, fmt.Sprintf("comment %s: author is not a member of the project", c.id))
++		}
++	}
+ 	return nil
+ }
+ 
++func (s *state) commentsOn(taskID string) []CommentView {
++	out := []CommentView{}
++	for _, c := range s.comments {
++		if c.task == taskID {
++			out = append(out, c.view())
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return s.comments[out[i].ID].seq < s.comments[out[j].ID].seq })
++	return out
++}
++
++func (s *state) newCommentID() (string, int) {
++	s.nextCID++
++	return fmt.Sprintf("c%d", s.nextCID), s.nextCID
++}
++
+ func (s *state) tasksIn(projectID string) []TaskView {
+ 	out := []TaskView{}
+ 	for _, t := range s.tasks {
+@@ -131,6 +177,10 @@ func (t task) view() TaskView {
+ 	return TaskView{ID: t.id, ProjectID: t.project, Title: t.title, Status: t.status, Assignee: t.assignee.user}
+ }
+ 
++func (c comment) view() CommentView {
++	return CommentView{ID: c.id, TaskID: c.task, Author: c.author, Body: c.body}
++}
++
+ type store struct {
+ 	mu  sync.Mutex
+ 	cur *state
+@@ -165,6 +215,7 @@ func newSeededStore() *store {
+ 		projects: map[string]project{},
+ 		members:  map[string]map[string]string{},
+ 		tasks:    map[string]task{},
++		comments: map[string]comment{},
+ 	}
+ 	for _, u := range []user{
+ 		{id: "ann", org: "acme"},
+diff --git a/main.go b/main.go
+index 29de540..a28bc97 100644
+--- a/main.go
++++ b/main.go
+@@ -34,6 +34,9 @@ import (
+ // Task is the JSON shape of a task.
+ type Task = capability.TaskView
+ 
++// Comment is the JSON shape of a comment.
++type Comment = capability.CommentView
++
+ type rootRegistry struct{}
+ 
+ // projectRegistry is the whole handler-visible surface under /projects/{pid}.
+@@ -46,6 +49,11 @@ type taskRegistry struct {
+ 	scope capability.TaskScope
+ }
+ 
++// commentRegistry is the whole handler-visible surface under /comments/{cid}.
++type commentRegistry struct {
++	scope capability.CommentScope
++}
++
+ func init() {
+ 	// tanukirpc logs every request through the default slog logger; keep the
+ 	// demo and test output quiet.
+@@ -76,8 +84,14 @@ func newServer() http.Handler {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+ 			tr.Patch("/", tanukirpc.NewHandler(updateTask))
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
++			tr.Get("/comments", tanukirpc.NewHandler(listComments))
++			tr.Post("/comments", tanukirpc.NewHandler(createComment))
+ 		})
+ 	})
++
++	tanukirpc.RouteWithTransformer(r, commentTransformer(authz), "/comments/{cid}", func(cr *tanukirpc.Router[*commentRegistry]) {
++		cr.Get("/", tanukirpc.NewHandler(getComment))
++	})
+ 	return r
+ }
+ 
+@@ -99,6 +113,17 @@ func taskTransformer() tanukirpc.Transformer[*projectRegistry, *taskRegistry] {
+ 	})
+ }
+ 
++// commentTransformer authenticates the caller and binds the scope to {cid}.
++func commentTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*rootRegistry, *commentRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*rootRegistry]) (*commentRegistry, error) {
++		actor, err := authz.Authenticate(ctx.Request().Header.Get("X-User"))
++		if err != nil {
++			return nil, err
++		}
++		return &commentRegistry{scope: actor.Comment(chi.URLParam(ctx.Request(), "cid"))}, nil
++	})
++}
++
+ // ---- handlers -------------------------------------------------------------------
+ 
+ func listTasks(ctx tanukirpc.Context[*projectRegistry], _ struct{}) ([]Task, error) {
+@@ -177,6 +202,43 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++func listComments(ctx tanukirpc.Context[*taskRegistry], _ struct{}) ([]Comment, error) {
++	t, err := ctx.Registry().scope.Read()
++	if err != nil {
++		return nil, err
++	}
++	return t.Comments(), nil
++}
++
++type commentRequest struct {
++	Body string `json:"body"`
++}
++
++func createComment(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Comment, error) {
++	t, err := ctx.Registry().scope.Comment()
++	if err != nil {
++		return nil, err
++	}
++	var req commentRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil {
++		return nil, errInvalidBody
++	}
++	c, err := t.AddComment(req.Body)
++	if err != nil {
++		return nil, err
++	}
++	return writeJSON(ctx.Response(), http.StatusCreated, c)
++}
++
++func getComment(ctx tanukirpc.Context[*commentRegistry], _ struct{}) (*Comment, error) {
++	c, err := ctx.Registry().scope.Read()
++	if err != nil {
++		return nil, err
++	}
++	v := c.View()
++	return &v, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // httpError is an error with an explicit status for request-shape problems
+diff --git a/main_test.go b/main_test.go
+index 0277f51..20e9b39 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,153 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestAddComment(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"viewer comments", "dan", "/projects/web/tasks/t1/comments", `{"body":"hi"}`, 201},
++		{"contributor own task", "ben", "/projects/web/tasks/t1/comments", `{"body":"hi"}`, 201},
++		{"contributor others task", "ben", "/projects/web/tasks/t2/comments", `{"body":"hi"}`, 201},
++		{"manager", "ann", "/projects/web/tasks/t1/comments", `{"body":"hi"}`, 201},
++		{"org admin without role", "eve", "/projects/web/tasks/t1/comments", `{"body":"hi"}`, 403},
++		{"non member", "hal", "/projects/web/tasks/t1/comments", `{"body":"hi"}`, 404},
++		{"other org", "gus", "/projects/web/tasks/t1/comments", `{"body":"hi"}`, 404},
++		{"anonymous", "", "/projects/web/tasks/t1/comments", `{"body":"hi"}`, 401},
++		{"unknown user", "zed", "/projects/web/tasks/t1/comments", `{"body":"hi"}`, 401},
++		{"empty body", "ann", "/projects/web/tasks/t1/comments", `{"body":""}`, 400},
++		{"missing body", "ann", "/projects/web/tasks/t1/comments", `{}`, 400},
++		{"malformed json", "ann", "/projects/web/tasks/t1/comments", `{`, 400},
++		{"task in other project", "ann", "/projects/web/tasks/t4/comments", `{"body":"hi"}`, 404},
++		{"archived", "ann", "/projects/legacy/tasks/t5/comments", `{"body":"hi"}`, 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestAddCommentResponse(t *testing.T) {
++	code, body := do(t, newServer(), "POST", "/projects/web/tasks/t1/comments", "dan", `{"body":"looks good"}`)
++	if code != 201 {
++		t.Fatalf("got %d want 201", code)
++	}
++	var got Comment
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := Comment{ID: "c1", TaskID: "t1", Author: "dan", Body: "looks good"}
++	if got != want {
++		t.Fatalf("got %+v want %+v", got, want)
++	}
++}
++
++func TestListComments(t *testing.T) {
++	h := newServer()
++	do(t, h, "POST", "/projects/web/tasks/t1/comments", "ann", `{"body":"first"}`)
++	do(t, h, "POST", "/projects/web/tasks/t2/comments", "ann", `{"body":"elsewhere"}`)
++	do(t, h, "POST", "/projects/web/tasks/t1/comments", "ben", `{"body":"second"}`)
++
++	code, body := do(t, h, "GET", "/projects/web/tasks/t1/comments", "dan", "")
++	if code != 200 {
++		t.Fatalf("got %d want 200", code)
++	}
++	var got []Comment
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	if len(got) != 2 || got[0].Body != "first" || got[1].Body != "second" {
++		t.Fatalf("unexpected comments: %+v", got)
++	}
++	for _, c := range got {
++		if c.TaskID != "t1" {
++			t.Fatalf("leaked comment %s of task %s", c.ID, c.TaskID)
++		}
++	}
++
++	_, body = do(t, h, "GET", "/projects/web/tasks/t3/comments", "dan", "")
++	if body != "[]\n" {
++		t.Fatalf("want empty list, got %q", body)
++	}
++}
++
++func TestListCommentsAccess(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"viewer", "dan", "/projects/web/tasks/t1/comments", 200},
++		{"org admin", "eve", "/projects/web/tasks/t1/comments", 200},
++		{"non member", "hal", "/projects/web/tasks/t1/comments", 404},
++		{"other org", "gus", "/projects/web/tasks/t1/comments", 404},
++		{"anonymous", "", "/projects/web/tasks/t1/comments", 401},
++		{"task in other project", "ann", "/projects/web/tasks/t4/comments", 404},
++		{"archived readable", "ben", "/projects/legacy/tasks/t5/comments", 200},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "GET", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestGetComment(t *testing.T) {
++	h := newServer()
++	do(t, h, "POST", "/projects/web/tasks/t1/comments", "ben", `{"body":"hi"}`)
++
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"viewer", "dan", "/comments/c1", 200},
++		{"member author", "ben", "/comments/c1", 200},
++		{"org admin", "eve", "/comments/c1", 200},
++		{"non member", "hal", "/comments/c1", 404},
++		{"other org", "gus", "/comments/c1", 404},
++		{"anonymous", "", "/comments/c1", 401},
++		{"unknown comment", "ann", "/comments/c999", 404},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, h, "GET", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++
++	_, body := do(t, h, "GET", "/comments/c1", "dan", "")
++	var got Comment
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := Comment{ID: "c1", TaskID: "t1", Author: "ben", Body: "hi"}
++	if got != want {
++		t.Fatalf("got %+v want %+v", got, want)
++	}
++}
++
++func TestCommentsFollowTaskDelete(t *testing.T) {
++	h := newServer()
++	do(t, h, "POST", "/projects/web/tasks/t1/comments", "ann", `{"body":"hi"}`)
++	if code, _ := do(t, h, "DELETE", "/projects/web/tasks/t1", "ann", ""); code != 204 {
++		t.Fatalf("delete got %d want 204", code)
++	}
++	if code, _ := do(t, h, "GET", "/comments/c1", "ann", ""); code != 404 {
++		t.Fatalf("comment of deleted task got %d want 404", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/tasks/t1/comments", "ann", `{"body":"x"}`); code != 404 {
++		t.Fatalf("comment on deleted task got %d want 404", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

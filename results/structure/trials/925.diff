@@ -1,0 +1,356 @@
+diff --git a/README.md b/README.md
+index 3fe8794..30f4cf0 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members/{uid}/move` | `{"toProjectId"}` → 200 `{"userId","projectId","role"}` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`. Request
+ bodies are JSON (`Content-Type: application/json`).
+@@ -37,6 +38,14 @@ bodies are JSON (`Content-Type: application/json`).
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Moving a member (`POST /projects/{pid}/members/{uid}/move`) requires the
++  `manager` role in both the source project and the destination project.
++  A destination the user cannot read → 404; a destination where they are not a
++  manager → 403; archived source or destination → 409. The member must be a
++  member of the source project (else 404) and must not already be a member of
++  the destination (else 409). The member keeps their role. Their tasks in the
++  source project become unassigned, since they are no longer members there.
++  Moving to the same project → 400.
+ 
+ ## Seed data
+ 
+@@ -77,10 +86,10 @@ Transformer "/projects/{pid}"   authenticates X-User, builds ProjectAuthz -> pro
+   object and an input:
+   `model.NewTaskTable().Create(ctx, reg.db, reg.authz, model.TaskTableCreateInput{...})`.
+   The operation asks the authorization object whether the accessor may
+-  perform it (`CanWrite`, `CanAssign`, `CanEdit`, `CanReassign`, `CanManage`);
+-  a denial is an error that maps onto the HTTP status convention
+-  (`ErrUnauthenticated` 401, `ErrNotFound` 404, `ErrForbidden` 403,
+-  `ErrArchived` 409, `ErrInvalid` 400).
++  perform it (`CanWrite`, `CanAssign`, `CanEdit`, `CanReassign`, `CanManage`,
++  `CanManageMembers`); a denial is an error that maps onto the HTTP status
++  convention (`ErrUnauthenticated` 401, `ErrNotFound` 404, `ErrForbidden` 403,
++  `ErrArchived` and `ErrConflict` 409, `ErrInvalid` 400).
+ - `model.DB` is satisfied by `*sql.DB` and `*sql.Tx`. A table operation that
+   writes runs in a transaction: given a `*sql.DB` it begins and commits its
+   own; given a `*sql.Tx` it runs inside it. A failed write rolls back, so a
+diff --git a/internal/model/aggregate.go b/internal/model/aggregate.go
+index e558654..e4efc3e 100644
+--- a/internal/model/aggregate.go
++++ b/internal/model/aggregate.go
+@@ -126,6 +126,68 @@ func (a *updateTaskAggregate) apply(ctx context.Context, tx DB) (*Task, error) {
+ 	return t, nil
+ }
+ 
++// moveMemberAggregate moves one member from one project to another.
++type moveMemberAggregate struct {
++	from  *Membership // the member in the source project
++	to    *Project    // the destination project
++	user  *User       // the member's user (its organization must match the destination's)
++	tasks []*Task     // the member's tasks in the source project; they are unassigned
++}
++
++func loadMoveMember(ctx context.Context, tx DB, fromID, toID, userID string) (*moveMemberAggregate, error) {
++	from, err := NewMembershipTable().Find(ctx, tx, fromID, userID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	if _, err := NewMembershipTable().Find(ctx, tx, toID, userID); err == nil {
++		return nil, deny(ErrConflict, "user is already a member of the destination project")
++	} else if !errors.Is(err, ErrNoRows) {
++		return nil, err
++	}
++	to, err := NewProjectTable().Find(ctx, tx, toID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	u, err := from.User(ctx, tx)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrInvalid, "member must be an existing user")
++	} else if err != nil {
++		return nil, err
++	}
++	tasks, err := from.AssignedTasks(ctx, tx)
++	if err != nil {
++		return nil, err
++	}
++	return &moveMemberAggregate{from: from, to: to, user: u, tasks: tasks}, nil
++}
++
++func (a *moveMemberAggregate) validate() error {
++	if a.user.Org != a.to.Org {
++		return deny(ErrInvalid, "member must belong to the destination's organization")
++	}
++	return nil
++}
++
++func (a *moveMemberAggregate) apply(ctx context.Context, tx DB) (*Membership, error) {
++	for _, t := range a.tasks {
++		if err := t.unassign(ctx, tx); err != nil {
++			return nil, err
++		}
++	}
++	if err := a.from.remove(ctx, tx); err != nil {
++		return nil, err
++	}
++	to := &Membership{ProjectID: a.to.ID, UserID: a.from.UserID, Role: a.from.Role}
++	if err := to.save(ctx, tx); err != nil {
++		return nil, err
++	}
++	return to, nil
++}
++
+ // deleteTaskAggregate removes one task.
+ type deleteTaskAggregate struct {
+ 	task *Task
+diff --git a/internal/model/authz.go b/internal/model/authz.go
+index 89224a1..0421185 100644
+--- a/internal/model/authz.go
++++ b/internal/model/authz.go
+@@ -58,6 +58,18 @@ func (a ProjectAuthz) CanWrite() error {
+ 	return nil
+ }
+ 
++// CanManageMembers returns nil if the actor may move members out of or into the
++// project: managers only (else ErrForbidden) and not archived (else ErrArchived).
++func (a ProjectAuthz) CanManageMembers() error {
++	if !a.CanRead() || a.role != RoleManager {
++		return deny(ErrForbidden, "only managers may move members")
++	}
++	if a.archived {
++		return deny(ErrArchived, "project is archived")
++	}
++	return nil
++}
++
+ // CanAssign returns nil if the actor may make userID the assignee of a new
+ // task: contributors may only assign themselves (else ErrForbidden).
+ func (a ProjectAuthz) CanAssign(userID string) error {
+diff --git a/internal/model/membership_table.go b/internal/model/membership_table.go
+index 3e01344..166a326 100644
+--- a/internal/model/membership_table.go
++++ b/internal/model/membership_table.go
+@@ -51,3 +51,47 @@ func (*MembershipTable) list(ctx context.Context, db DB, query string, args ...a
+ 	}
+ 	return out, nil
+ }
++
++// ---- operations -----------------------------------------------------------------------
++
++// MembershipTableMoveInput is the input of MembershipTable.Move.
++type MembershipTableMoveInput struct {
++	ToProjectID string
++}
++
++// Move moves a member from the project of the authorization object to another
++// project, keeping the role. The actor must manage both projects. The member's
++// tasks in the source project become unassigned, since they are no longer
++// members there.
++func (mt *MembershipTable) Move(ctx context.Context, db DB, from ProjectAuthz, userID string, in MembershipTableMoveInput) (*Membership, error) {
++	if err := from.CanManageMembers(); err != nil {
++		return nil, err
++	}
++	if in.ToProjectID == from.ProjectID() {
++		return nil, deny(ErrInvalid, "member is already in this project")
++	}
++	to, err := NewProjectAuthz(ctx, db, from.Actor(), in.ToProjectID)
++	if err != nil {
++		return nil, err
++	}
++	if err := to.CanManageMembers(); err != nil {
++		return nil, err
++	}
++	var m *Membership
++	if err := inTx(ctx, db, func(tx DB) error {
++		agg, err := loadMoveMember(ctx, tx, from.ProjectID(), to.ProjectID(), userID)
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		if m, err = agg.apply(ctx, tx); err != nil {
++			return err
++		}
++		return nil
++	}); err != nil {
++		return nil, err
++	}
++	return m, nil
++}
+diff --git a/internal/model/model.go b/internal/model/model.go
+index 9fe5d67..2630897 100644
+--- a/internal/model/model.go
++++ b/internal/model/model.go
+@@ -30,6 +30,7 @@ var (
+ 	ErrNotFound        = errors.New("not found")           // 404 (also used for "not readable")
+ 	ErrForbidden       = errors.New("forbidden")           // 403
+ 	ErrArchived        = errors.New("project is archived") // 409
++	ErrConflict        = errors.New("conflict")            // 409
+ 	ErrInvalid         = errors.New("invalid request")     // 400
+ )
+ 
+diff --git a/internal/model/record.go b/internal/model/record.go
+index b23b291..9d6b077 100644
+--- a/internal/model/record.go
++++ b/internal/model/record.go
+@@ -28,11 +28,12 @@ type Project struct {
+ 	Archived bool // archived projects are read-only
+ }
+ 
+-// Membership is a row of the memberships table.
++// Membership is a row of the memberships table. Its JSON form is the API's
++// membership.
+ type Membership struct {
+-	ProjectID string
+-	UserID    string
+-	Role      string
++	ProjectID string `json:"projectId"`
++	UserID    string `json:"userId"`
++	Role      string `json:"role"`
+ }
+ 
+ // Task is a row of the tasks table. Its JSON form is the API's task.
+@@ -194,3 +195,12 @@ func (r *Membership) save(ctx context.Context, db DB) error {
+ 	}
+ 	return nil
+ }
++
++// remove deletes the membership.
++func (r *Membership) remove(ctx context.Context, db DB) error {
++	if _, err := db.ExecContext(ctx,
++		`DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, r.ProjectID, r.UserID); err != nil {
++		return err
++	}
++	return nil
++}
+diff --git a/main.go b/main.go
+index 5bcd29e..6b19da3 100644
+--- a/main.go
++++ b/main.go
+@@ -77,6 +77,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(conn), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Post("/members/{uid}/move", tanukirpc.NewHandler(moveMember))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -138,6 +139,16 @@ func createTask(ctx tanukirpc.Context[*projectRegistry], req createRequest) (*Ta
+ 	return model.NewTaskTable().Create(ctx, reg.db, reg.authz, model.TaskTableCreateInput{Title: req.Title, AssigneeID: req.Assignee})
+ }
+ 
++type moveMemberRequest struct {
++	ToProjectID string `json:"toProjectId" validate:"required"`
++}
++
++func moveMember(ctx tanukirpc.Context[*projectRegistry], req moveMemberRequest) (*model.Membership, error) {
++	reg := ctx.Registry()
++	userID := chi.URLParam(ctx.Request(), "uid")
++	return model.NewMembershipTable().Move(ctx, reg.db, reg.authz, userID, model.MembershipTableMoveInput{ToProjectID: req.ToProjectID})
++}
++
+ func getTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Task, error) {
+ 	reg := ctx.Registry()
+ 	return model.NewTaskTable().Get(ctx, reg.db, reg.authz)
+@@ -197,7 +208,7 @@ func (errorHooker) OnError(w http.ResponseWriter, _ *http.Request, _ *slog.Logge
+ 		code, msg = http.StatusNotFound, err.Error()
+ 	case errors.Is(err, model.ErrForbidden):
+ 		code, msg = http.StatusForbidden, err.Error()
+-	case errors.Is(err, model.ErrArchived):
++	case errors.Is(err, model.ErrArchived), errors.Is(err, model.ErrConflict):
+ 		code, msg = http.StatusConflict, err.Error()
+ 	case errors.Is(err, model.ErrInvalid):
+ 		code, msg = http.StatusBadRequest, err.Error()
+diff --git a/main_test.go b/main_test.go
+index a54b0a8..56fe8c4 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -116,6 +116,77 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestMove(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager of both moves contributor", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 200},
++		{"manager of both moves viewer", "ivy", "/projects/web/members/dan/move", `{"toProjectId":"ops"}`, 200},
++		{"contributor", "ben", "/projects/web/members/cat/move", `{"toProjectId":"ops"}`, 403},
++		{"viewer", "dan", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"manager of source, viewer of destination", "ann", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"org admin", "eve", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"non member of source", "hal", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 404},
++		{"destination missing", "ann", "/projects/web/members/ben/move", `{"toProjectId":"nope"}`, 404},
++		{"destination other org", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"gx"}`, 404},
++		{"destination archived", "ann", "/projects/web/members/cat/move", `{"toProjectId":"legacy"}`, 409},
++		{"source archived", "ann", "/projects/legacy/members/ben/move", `{"toProjectId":"web"}`, 409},
++		{"same project", "ann", "/projects/web/members/ben/move", `{"toProjectId":"web"}`, 400},
++		{"empty destination", "ann", "/projects/web/members/ben/move", `{}`, 400},
++		{"not a member of source", "ivy", "/projects/web/members/hal/move", `{"toProjectId":"ops"}`, 404},
++		{"already in destination", "ivy", "/projects/web/members/cat/move", `{"toProjectId":"ops"}`, 409},
++		{"anonymous", "", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 401},
++		{"unknown user", "zed", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveResponseAndEffects(t *testing.T) {
++	h := newServer()
++
++	code, body := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("move: got %d want 200 (%s)", code, body)
++	}
++	var got struct {
++		UserID    string `json:"userId"`
++		ProjectID string `json:"projectId"`
++		Role      string `json:"role"`
++	}
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	if got.UserID != "ben" || got.ProjectID != "ops" || got.Role != "contributor" {
++		t.Fatalf("response: got %+v", got)
++	}
++
++	// ben is no longer a member of web.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("ben reads web after move: got %d want 404", code)
++	}
++	// ben is now a contributor of ops.
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks", "ben", ""); code != 200 {
++		t.Fatalf("ben reads ops after move: got %d want 200", code)
++	}
++	// ben's task in web (t1) was assigned to ben and is now unassigned.
++	code, body = do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
++	if code != 200 || !strings.Contains(body, `"assignee":""`) {
++		t.Fatalf("t1 after move: got %d %s, want unassigned", code, body)
++	}
++	// Moving again from web fails: ben is no longer there.
++	if code, _ := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`); code != 404 {
++		t.Fatalf("second move: got %d want 404", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

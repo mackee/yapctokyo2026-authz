@@ -1,0 +1,210 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..59d82ce 100644
+--- a/README.md
++++ b/README.md
+@@ -22,6 +22,14 @@ go test ./...
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+ 
++| POST | `/orgs/{orgID}/users/{uid}/transfer` | `{"toOrgId"}` → 200 `{"id","orgId"}` |
++
++Transfer: only an org admin of `orgID` may move a user of that org. The user's
++project memberships and task assignments in the old org are removed, and org
++admin status is reset (not carried to the new org). The destination org must
++exist (400 otherwise) and differ from the current one (400). Callers outside
++`orgID`, or a user not in `orgID` → 404; non-admin caller → 403.
++
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+ ## Access rules
+diff --git a/allowed_test.go b/allowed_test.go
+index 7e3395e..2397dcd 100644
+--- a/allowed_test.go
++++ b/allowed_test.go
+@@ -31,6 +31,9 @@ func TestAllowed(t *testing.T) {
+ 		{"manager reassigns task", "ann", "PATCH", "/projects/web/tasks/t2", `{"assignee":"ben"}`, 200},
+ 		{"manager unassigns task", "ivy", "PATCH", "/projects/ops/tasks/t4", `{"assignee":""}`, 200},
+ 
++		// transfer
++		{"org admin transfers user", "eve", "POST", "/orgs/acme/users/hal/transfer", `{"toOrgId":"globex"}`, 200},
++
+ 		// delete
+ 		{"manager deletes task", "ann", "DELETE", "/projects/web/tasks/t1", "", 204},
+ 		{"manager deletes in other project", "ivy", "DELETE", "/projects/ops/tasks/t4", "", 204},
+diff --git a/main.go b/main.go
+index 647c0d2..c7a2eb6 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /orgs/{oid}/users/{uid}/transfer", s.transferUser)
+ 	return mux
+ }
+ 
+@@ -405,6 +406,88 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, 200, task)
+ }
+ 
++type transferRequest struct {
++	ToOrgID string `json:"toOrgId"`
++}
++
++// transferUser moves a user to another organization. Only an org admin of the
++// user's current org may do it. The user's project memberships and task
++// assignments in the old org are removed, and org admin status is not carried
++// over to the new org.
++func (s *server) transferUser(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	caller, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if caller == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	orgID := r.PathValue("oid")
++	if caller.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	target, err := findUser(ctx, s.db, r.PathValue("uid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if target == nil || target.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if !caller.OrgAdmin {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	var req transferRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToOrgID == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	if req.ToOrgID == orgID {
++		writeError(w, 400, "user already belongs to that organization")
++		return
++	}
++	// Organizations have no table of their own: one exists if it has users or projects.
++	var exists bool
++	if err := s.db.QueryRowContext(ctx,
++		`SELECT EXISTS (SELECT 1 FROM users WHERE org_id = ?1) OR EXISTS (SELECT 1 FROM projects WHERE org_id = ?1)`,
++		req.ToOrgID).Scan(&exists); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if !exists {
++		writeError(w, 400, "unknown destination organization")
++		return
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	stmts := []string{
++		`UPDATE tasks SET assignee = '' WHERE assignee = ?1 AND project_id IN (SELECT id FROM projects WHERE org_id = ?2)`,
++		`DELETE FROM memberships WHERE user_id = ?1 AND project_id IN (SELECT id FROM projects WHERE org_id = ?2)`,
++		`UPDATE users SET org_id = ?3, org_admin = 0 WHERE id = ?1`,
++	}
++	for _, q := range stmts {
++		if _, err := tx.ExecContext(ctx, q, target.ID, orgID, req.ToOrgID); err != nil {
++			writeError(w, 500, "internal error")
++			return
++		}
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, map[string]string{"id": target.ID, "orgId": req.ToOrgID})
++}
++
+ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	ctx := r.Context()
+ 	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
+diff --git a/main_test.go b/main_test.go
+index 5c16a74..4d13400 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,71 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestTransfer(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"org admin transfers", "eve", "/orgs/acme/users/ben/transfer", `{"toOrgId":"globex"}`, 200},
++		{"org admin transfers self", "eve", "/orgs/acme/users/eve/transfer", `{"toOrgId":"globex"}`, 200},
++		{"non admin", "ann", "/orgs/acme/users/ben/transfer", `{"toOrgId":"globex"}`, 403},
++		{"anonymous", "", "/orgs/acme/users/ben/transfer", `{"toOrgId":"globex"}`, 401},
++		{"other org admin", "gus", "/orgs/acme/users/ben/transfer", `{"toOrgId":"acme"}`, 404},
++		{"user not in org", "eve", "/orgs/acme/users/gus/transfer", `{"toOrgId":"globex"}`, 404},
++		{"unknown user", "eve", "/orgs/acme/users/zed/transfer", `{"toOrgId":"globex"}`, 404},
++		{"same org", "eve", "/orgs/acme/users/ben/transfer", `{"toOrgId":"acme"}`, 400},
++		{"unknown destination", "eve", "/orgs/acme/users/ben/transfer", `{"toOrgId":"nope"}`, 400},
++		{"empty destination", "eve", "/orgs/acme/users/ben/transfer", `{}`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, body := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d body=%s", code, c.want, body)
++			}
++		})
++	}
++}
++
++func TestTransferEffects(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/orgs/acme/users/ben/transfer", "eve", `{"toOrgId":"globex"}`)
++	if code != 200 {
++		t.Fatal(code, body)
++	}
++	var got map[string]string
++	json.Unmarshal([]byte(body), &got)
++	if got["id"] != "ben" || got["orgId"] != "globex" {
++		t.Fatalf("bad response %s", body)
++	}
++	// Lost access to the old org's projects.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("old project still readable: %d", code)
++	}
++	// Old assignments are cleared.
++	_, body = do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
++	var task Task
++	json.Unmarshal([]byte(body), &task)
++	if task.Assignee != "" {
++		t.Fatalf("assignee not cleared: %q", task.Assignee)
++	}
++	// Moving back must not resurrect old memberships.
++	if code, _ := do(t, h, "POST", "/orgs/globex/users/ben/transfer", "gus", `{"toOrgId":"acme"}`); code != 403 {
++		t.Fatalf("non-admin globex transfer: %d", code)
++	}
++}
++
++func TestTransferDropsAdmin(t *testing.T) {
++	h := newServer()
++	if code, body := do(t, h, "POST", "/orgs/acme/users/eve/transfer", "eve", `{"toOrgId":"globex"}`); code != 200 {
++		t.Fatal(code, body)
++	}
++	// eve must not be an admin of globex.
++	if code, _ := do(t, h, "GET", "/projects/gx/tasks", "eve", ""); code != 404 {
++		t.Fatalf("eve gained admin in new org: %d", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

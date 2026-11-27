@@ -1,0 +1,287 @@
+diff --git a/README.md b/README.md
+index 49b55af..a8f7218 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| DELETE | `/orgs/{orgID}/users/{uid}` | offboarding: removes the user from every project of the org → 204 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -34,6 +35,11 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Removing a user from an organization (`DELETE /orgs/{orgID}/users/{uid}`) takes
++  their memberships in all of the org's projects, and clears their assignments in
++  those projects (an assignee must stay a member). Only an org admin of that org
++  may do it: another org's caller or an unknown/other-org target → 404, a
++  non-admin member of the org → 403. Archived projects do not block it.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 647c0d2..3acd9ee 100644
+--- a/main.go
++++ b/main.go
+@@ -25,6 +25,9 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - removing a user from an org (offboarding): only an org admin of that org
++//     may do it; a caller from another org, or a target not in the org -> 404,
++//     a non-admin caller of the same org                        -> 403
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -49,6 +52,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("DELETE /orgs/{orgID}/users/{uid}", s.removeOrgUser)
+ 	return mux
+ }
+ 
+@@ -457,3 +461,57 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	w.WriteHeader(204)
+ }
++
++// removeOrgUser takes a user out of every project of an org (offboarding).
++// Their assignments in those projects are cleared, because an assignee must
++// stay a contributor or manager of the task's project.
++func (s *server) removeOrgUser(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	caller, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if caller == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	orgID := r.PathValue("orgID")
++	if caller.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if !caller.OrgAdmin {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	target, err := findUser(ctx, s.db, r.PathValue("uid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if target == nil || target.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	const orgProjects = `SELECT id FROM projects WHERE org_id = ?`
++	if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE user_id = ? AND project_id IN (`+orgProjects+`)`, target.ID, orgID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET assignee = '' WHERE assignee = ? AND project_id IN (`+orgProjects+`)`, target.ID, orgID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	w.WriteHeader(204)
++}
+diff --git a/main_test.go b/main_test.go
+index 5c16a74..eaa7066 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,82 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestRemoveOrgUser(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"org admin removes member", "eve", "/orgs/acme/users/ben", 204},
++		{"org admin removes non member", "eve", "/orgs/acme/users/hal", 204},
++		{"org admin, target in other org", "eve", "/orgs/acme/users/gus", 404},
++		{"org admin, unknown target", "eve", "/orgs/acme/users/zed", 404},
++		{"org admin, other org", "eve", "/orgs/globex/users/gus", 404},
++		{"manager of the org", "ann", "/orgs/acme/users/ben", 403},
++		{"member of other org", "gus", "/orgs/acme/users/ben", 404},
++		{"unknown caller", "zed", "/orgs/acme/users/ben", 401},
++		{"anonymous", "", "/orgs/acme/users/ben", 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveOrgUserEffects(t *testing.T) {
++	srv := newServer()
++	if code, body := do(t, srv, "DELETE", "/orgs/acme/users/ben", "eve", ""); code != 204 {
++		t.Fatalf("remove: got %d %s", code, body)
++	}
++
++	// The removed user loses access to every project of the org.
++	for _, path := range []string{"/projects/web/tasks", "/projects/legacy/tasks/t5"} {
++		if code, _ := do(t, srv, "GET", path, "ben", ""); code != 404 {
++			t.Fatalf("GET %s as ben: got %d want 404", path, code)
++		}
++	}
++	if code, _ := do(t, srv, "POST", "/projects/web/tasks", "ben", `{"title":"x"}`); code != 404 {
++		t.Fatalf("POST as ben: got %d want 404", code)
++	}
++
++	// Their assignments in the org's projects are cleared.
++	for _, c := range []struct{ project, id string }{{"web", "t1"}, {"legacy", "t5"}} {
++		var task Task
++		_, body := do(t, srv, "GET", "/projects/"+c.project+"/tasks/"+c.id, "ann", "")
++		if err := json.Unmarshal([]byte(body), &task); err != nil {
++			t.Fatal(err)
++		}
++		if task.Assignee != "" {
++			t.Fatalf("task %s still assigned to %q", c.id, task.Assignee)
++		}
++	}
++
++	// Everything else is untouched: other members, other assignments, other orgs.
++	checks := []struct {
++		user, path, assignee string
++	}{
++		{"ann", "/projects/web/tasks/t2", "cat"},
++		{"gus", "/projects/gx/tasks/t6", "gus"},
++	}
++	for _, c := range checks {
++		var task Task
++		code, body := do(t, srv, "GET", c.path, c.user, "")
++		if code != 200 {
++			t.Fatalf("GET %s: got %d", c.path, code)
++		}
++		json.Unmarshal([]byte(body), &task)
++		if task.Assignee != c.assignee {
++			t.Fatalf("GET %s: assignee %q want %q", c.path, task.Assignee, c.assignee)
++		}
++	}
++	if code, _ := do(t, srv, "GET", "/projects/web/tasks", "ann", ""); code != 200 {
++		t.Fatalf("ann lost web access: %d", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string
+diff --git a/spec/taskboard.qnt b/spec/taskboard.qnt
+index fe78764..4d42aa2 100644
+--- a/spec/taskboard.qnt
++++ b/spec/taskboard.qnt
+@@ -26,6 +26,7 @@ module taskboard {
+ 
+   pure val USERS = Set("ann", "ben", "cat", "dan", "eve", "hal", "ivy", "gus", "nobody")
+   pure val PROJECTS = Set("web", "ops", "legacy", "gx", "missing")
++  pure val ORGS = Set("acme", "globex", "initech")
+   pure val ROLES = Set("manager", "contributor", "viewer")
+   pure val STATUSES = Set("open", "doing", "done")
+ 
+@@ -123,6 +124,17 @@ module taskboard {
+     else if (projects.get(p).archived) 409
+     else 204
+ 
++  // DELETE /orgs/{o}/users/{target}: take the user out of every project of the
++  // org (offboarding). Only an org admin of that org may do it; the org must be
++  // the caller's, and the target must be a user of that org (otherwise 404).
++  // Archived projects do not block this: revoking access is not a content write.
++  def removeOrgUserOutcome(u: UserId, o: str, target: UserId): int =
++    if (not(userExists(u))) 401
++    else if (users.get(u).org != o) 404
++    else if (not(users.get(u).orgAdmin)) 403
++    else if (not(userExists(target)) or users.get(target).org != o) 404
++    else 204
++
+   // ---- actions -------------------------------------------------------------
+ 
+   action unchanged = all {
+@@ -164,6 +176,22 @@ module taskboard {
+       members' = members,
+     } else unchanged
+ 
++  // Removes the user's memberships in the org's projects. Their assignments in
++  // those projects are cleared, since an assignee must stay a writer (see
++  // inv_assigneeIsWriter).
++  action removeOrgUser(u: UserId, o: str, target: UserId): bool =
++    if (removeOrgUserOutcome(u, o, target) == 204) all {
++      members' = members.keys().filter(k => not(projects.get(k._1).org == o and k._2 == target)).mapBy(k => members.get(k)),
++      tasks' = tasks.keys().mapBy(t => {
++        project: tasks.get(t).project,
++        status: tasks.get(t).status,
++        assignee: if (tasks.get(t).assignee == target and projects.get(tasks.get(t).project).org == o) "" else tasks.get(t).assignee,
++      }),
++      users' = users,
++      projects' = projects,
++      nextTask' = nextTask,
++    } else unchanged
++
+   // ---- seed data and steps -------------------------------------------------
+ 
+   action init = all {
+@@ -202,10 +230,13 @@ module taskboard {
+     nondet t = 1.to(nextTask).oneOf()
+     nondet s = STATUSES.oneOf()
+     nondet changeAssignee = Set(true, false).oneOf()
++    nondet o = ORGS.oneOf()
++    nondet target = USERS.oneOf()
+     any {
+       createTask(u, p, a),
+       updateTask(u, p, t, s, changeAssignee, a),
+       deleteTask(u, p, t),
++      removeOrgUser(u, o, target),
+     }
+   }
+ 
+@@ -232,4 +263,28 @@ module taskboard {
+       assert(deleteOutcome("ann", "web", 4) == 404),
+       unchanged,
+     })
++
++  // Offboarding checks: who may remove whom, and what is left behind.
++  run removeOrgUserOutcomeTest =
++    init.then(all {
++      assert(removeOrgUserOutcome("eve", "acme", "ben") == 204),
++      assert(removeOrgUserOutcome("eve", "acme", "gus") == 404),
++      assert(removeOrgUserOutcome("eve", "globex", "gus") == 404),
++      assert(removeOrgUserOutcome("ann", "acme", "ben") == 403),
++      assert(removeOrgUserOutcome("gus", "acme", "ben") == 404),
++      assert(removeOrgUserOutcome("nobody", "acme", "ben") == 401),
++      unchanged,
++    })
++
++  run removeOrgUserTest =
++    init.then(removeOrgUser("eve", "acme", "ben")).then(all {
++      assert(not(members.keys().contains(("web", "ben")))),
++      assert(not(members.keys().contains(("legacy", "ben")))),
++      assert(members.get(("web", "cat")) == "contributor"),
++      assert(tasks.get(1).assignee == ""),
++      assert(tasks.get(5).assignee == ""),
++      assert(tasks.get(2).assignee == "cat"),
++      assert(tasks.get(6).assignee == "gus"),
++      unchanged,
++    })
+ }

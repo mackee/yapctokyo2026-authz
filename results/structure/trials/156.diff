@@ -1,0 +1,301 @@
+diff --git a/README.md b/README.md
+index 8d54490..9b01645 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/orgs/{orgID}/users/{uid}/out-of-office` | `{"delegate"}` → 200 with the moved tasks |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,14 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Out of office: only an org admin of the path's organization may call
++  `POST /orgs/{orgID}/users/{uid}/out-of-office`. Another organization → 404,
++  a non-admin → 403, a user not in the organization → 404. Every task
++  assigned to `{uid}` in every project of the organization moves to `delegate`.
++  The delegate must be a contributor or manager of each of those projects
++  (else 400); `delegate` must be set and differ from `{uid}` (400). If any of
++  those tasks is in an archived project the request is 409. The move is
++  all-or-nothing, and the response lists the moved tasks (`[]` if none).
+ 
+ ## Seed data
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..f0f041b 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -111,6 +111,7 @@ func (a *Authorizer) Authenticate(userID string) (ActorScope, error) {
+ type ActorScope interface {
+ 	Actor() Actor
+ 	Project(projectID string) ProjectScope
++	Org(orgID string) OrgScope
+ }
+ 
+ // ProjectScope is bound to one actor and one project ID. It grants nothing by
+diff --git a/internal/capability/org.go b/internal/capability/org.go
+new file mode 100644
+index 0000000..3206820
+--- /dev/null
++++ b/internal/capability/org.go
+@@ -0,0 +1,81 @@
++package capability
++
++import "sort"
++
++// OrgScope is bound to one actor and one organization ID.
++type OrgScope interface {
++	Admin() (OrgAdmin, error)
++}
++
++// OrgAdmin may perform organization-wide administration.
++type OrgAdmin interface {
++	// Delegate moves every task assigned to userID, in every project of the
++	// organization, to delegate, and returns the moved tasks (sorted by ID).
++	// It is all-or-nothing: if any task cannot be moved, nothing changes.
++	Delegate(userID, delegate string) ([]TaskView, error)
++}
++
++type orgScope struct {
++	as    *actorScope
++	orgID string
++}
++
++func (s *actorScope) Org(orgID string) OrgScope {
++	return &orgScope{as: s, orgID: orgID}
++}
++
++// Admin applies the org admin rule: the organization must be the actor's own
++// (else 404), and the actor must be an org admin (else 403).
++func (s *orgScope) Admin() (OrgAdmin, error) {
++	if s.orgID != s.as.actor.org {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	if !s.as.actor.orgAdmin {
++		return nil, deny(ErrForbidden, "forbidden")
++	}
++	return &orgAdmin{os: s}, nil
++}
++
++type orgAdmin struct{ os *orgScope }
++
++func (o *orgAdmin) Delegate(userID, delegate string) ([]TaskView, error) {
++	if delegate == "" || delegate == userID {
++		return nil, deny(ErrInvalid, "delegate must be a different user")
++	}
++	out := []TaskView{}
++	err := o.os.as.a.st.tx(func(s *state) error {
++		u, ok := s.users[userID]
++		if !ok || u.org != o.os.orgID {
++			return deny(ErrNotFound, "not found")
++		}
++
++		var ids []string
++		for id, t := range s.tasks {
++			if t.assignee.user == userID && s.projects[t.project].org == o.os.orgID {
++				ids = append(ids, id)
++			}
++		}
++		sort.Strings(ids)
++
++		for _, id := range ids {
++			t := s.tasks[id]
++			if s.projects[t.project].archived {
++				return deny(ErrArchived, "project is archived")
++			}
++			// admit checks that delegate is a contributor or manager of this
++			// task's project, so the store invariants keep holding.
++			a, err := admit(s, t.project, delegate)
++			if err != nil {
++				return err
++			}
++			t.assignee = a
++			s.tasks[id] = t
++			out = append(out, t.view())
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
+diff --git a/main.go b/main.go
+index 29de540..24b68d4 100644
+--- a/main.go
++++ b/main.go
+@@ -46,6 +46,11 @@ type taskRegistry struct {
+ 	scope capability.TaskScope
+ }
+ 
++// orgRegistry is the handler-visible surface under /orgs/{orgID}.
++type orgRegistry struct {
++	scope capability.OrgScope
++}
++
+ func init() {
+ 	// tanukirpc logs every request through the default slog logger; keep the
+ 	// demo and test output quiet.
+@@ -78,9 +83,24 @@ func newServer() http.Handler {
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
+ 		})
+ 	})
++
++	tanukirpc.RouteWithTransformer(r, orgTransformer(authz), "/orgs/{orgID}", func(or *tanukirpc.Router[*orgRegistry]) {
++		or.Post("/users/{uid}/out-of-office", tanukirpc.NewHandler(delegateOutOfOffice))
++	})
+ 	return r
+ }
+ 
++// orgTransformer authenticates the caller and binds the scope to {orgID}.
++func orgTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*rootRegistry, *orgRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*rootRegistry]) (*orgRegistry, error) {
++		actor, err := authz.Authenticate(ctx.Request().Header.Get("X-User"))
++		if err != nil {
++			return nil, err
++		}
++		return &orgRegistry{scope: actor.Org(chi.URLParam(ctx.Request(), "orgID"))}, nil
++	})
++}
++
+ // projectTransformer authenticates the caller and binds the scope to {pid}.
+ // The Authorizer stays in this closure; it is never put in a registry.
+ func projectTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*rootRegistry, *projectRegistry] {
+@@ -165,6 +185,24 @@ func updateTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Task, error)
+ 	return &v, nil
+ }
+ 
++type outOfOfficeRequest struct {
++	Delegate string `json:"delegate"`
++}
++
++// delegateOutOfOffice reassigns every task of {uid} in the organization to
++// the delegate. Only organization admins may call it.
++func delegateOutOfOffice(ctx tanukirpc.Context[*orgRegistry], _ struct{}) ([]Task, error) {
++	a, err := ctx.Registry().scope.Admin()
++	if err != nil {
++		return nil, err
++	}
++	var req outOfOfficeRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil {
++		return nil, errInvalidBody
++	}
++	return a.Delegate(chi.URLParam(ctx.Request(), "uid"), req.Delegate)
++}
++
+ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, error) {
+ 	t, err := ctx.Registry().scope.Manage()
+ 	if err != nil {
+diff --git a/out_of_office_test.go b/out_of_office_test.go
+new file mode 100644
+index 0000000..4b0da51
+--- /dev/null
++++ b/out_of_office_test.go
+@@ -0,0 +1,103 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestOutOfOfficeAccess(t *testing.T) {
++	const body = `{"delegate":"ivy"}`
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"org admin", "eve", "/orgs/acme/users/cat/out-of-office", body, 200},
++		{"org admin, user with no tasks", "eve", "/orgs/acme/users/hal/out-of-office", body, 200},
++		{"manager is not org admin", "ann", "/orgs/acme/users/cat/out-of-office", body, 403},
++		{"contributor is not org admin", "ben", "/orgs/acme/users/cat/out-of-office", body, 403},
++		{"anonymous", "", "/orgs/acme/users/cat/out-of-office", body, 401},
++		{"unknown user", "zed", "/orgs/acme/users/cat/out-of-office", body, 401},
++		{"other org admin of own org", "gus", "/orgs/acme/users/cat/out-of-office", body, 404},
++		{"org admin of other org", "eve", "/orgs/globex/users/gus/out-of-office", body, 404},
++		{"user not in org", "eve", "/orgs/acme/users/gus/out-of-office", body, 404},
++		{"missing delegate", "eve", "/orgs/acme/users/cat/out-of-office", `{}`, 400},
++		{"empty body", "eve", "/orgs/acme/users/cat/out-of-office", ``, 400},
++		{"delegate is the user", "eve", "/orgs/acme/users/cat/out-of-office", `{"delegate":"cat"}`, 400},
++		{"delegate is a viewer of a project", "eve", "/orgs/acme/users/cat/out-of-office", `{"delegate":"dan"}`, 400},
++		{"delegate not in org", "eve", "/orgs/acme/users/cat/out-of-office", `{"delegate":"gus"}`, 400},
++		{"delegate not in one project", "eve", "/orgs/acme/users/cat/out-of-office", `{"delegate":"ben"}`, 400},
++		{"archived project task", "eve", "/orgs/acme/users/ben/out-of-office", `{"delegate":"ann"}`, 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestOutOfOfficeReassignsAllProjects(t *testing.T) {
++	srv := newServer()
++
++	code, body := do(t, srv, "POST", "/orgs/acme/users/cat/out-of-office", "eve", `{"delegate":"ivy"}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var moved []Task
++	if err := json.Unmarshal([]byte(body), &moved); err != nil {
++		t.Fatal(err)
++	}
++	// cat holds t2 (web) and t4 (ops).
++	if len(moved) != 2 || moved[0].ID != "t2" || moved[1].ID != "t4" {
++		t.Fatalf("moved tasks: %+v", moved)
++	}
++	for _, task := range moved {
++		if task.Assignee != "ivy" {
++			t.Fatalf("task %s assignee %q, want ivy", task.ID, task.Assignee)
++		}
++	}
++
++	// The change is visible through the normal task endpoints.
++	for _, path := range []string{"/projects/web/tasks/t2", "/projects/ops/tasks/t4"} {
++		code, body := do(t, srv, "GET", path, "ann", "")
++		if code != 200 {
++			t.Fatalf("%s: got %d", path, code)
++		}
++		var task Task
++		if err := json.Unmarshal([]byte(body), &task); err != nil {
++			t.Fatal(err)
++		}
++		if task.Assignee != "ivy" {
++			t.Fatalf("%s assignee %q, want ivy", path, task.Assignee)
++		}
++	}
++
++	// Nothing is left for cat, so a second call moves nothing and returns [].
++	code, body = do(t, srv, "POST", "/orgs/acme/users/cat/out-of-office", "eve", `{"delegate":"ivy"}`)
++	if code != 200 || body != "[]\n" {
++		t.Fatalf("second call: got %d %q, want 200 []", code, body)
++	}
++}
++
++func TestOutOfOfficeIsAllOrNothing(t *testing.T) {
++	srv := newServer()
++
++	// ben cannot take over cat's ops task (ben is not a member of ops), so the
++	// whole request fails and the web task t2 must stay with cat.
++	code, _ := do(t, srv, "POST", "/orgs/acme/users/cat/out-of-office", "eve", `{"delegate":"ben"}`)
++	if code != 400 {
++		t.Fatalf("got %d want 400", code)
++	}
++	for _, path := range []string{"/projects/web/tasks/t2", "/projects/ops/tasks/t4"} {
++		_, body := do(t, srv, "GET", path, "ann", "")
++		var task Task
++		if err := json.Unmarshal([]byte(body), &task); err != nil {
++			t.Fatal(err)
++		}
++		if task.Assignee != "cat" {
++			t.Fatalf("%s assignee %q after failed request, want cat", path, task.Assignee)
++		}
++	}
++}

@@ -1,0 +1,246 @@
+diff --git a/README.md b/README.md
+index 8d54490..ecbe899 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| DELETE | `/projects/{pid}/members/{uid}` | remove a member from the project → 204 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -30,6 +31,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Only managers may remove members from a project. A user who is not a member of the project (or is unknown) → 404. Removing a member unassigns that user's tasks in the project; the user's membership in other projects is unaffected.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+@@ -60,7 +62,7 @@ Transformer "/projects/{pid}"   authenticates X-User -> projectRegistry{scope Pr
+ 
+ - Handlers only see **scopes** bound to the authenticated actor and the path.
+   To read or write anything they **acquire a capability** from a scope:
+-  `ProjectScope.Read()/Write()`, `TaskScope.Read()/Edit()/Manage()`. Each
++  `ProjectScope.Read()/Write()/Manage()`, `TaskScope.Read()/Edit()/Manage()`. Each
+   acquisition applies the access rules and returns an error that maps onto the
+   HTTP status convention (`ErrUnauthenticated` 401, `ErrNotFound` 404,
+   `ErrForbidden` 403, `ErrArchived` 409, `ErrInvalid` 400).
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..c390336 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -5,7 +5,7 @@
+ // from them:
+ //
+ //	ActorScope   -> Project(pid) ProjectScope
+-//	ProjectScope -> Read() ReadProject | Write() WriteProject | Task(tid) TaskScope
++//	ProjectScope -> Read() ReadProject | Write() WriteProject | Manage() ManageProject | Task(tid) TaskScope
+ //	TaskScope    -> Read() ReadTask    | Edit() EditTask      | Manage() ManageTask
+ //
+ // Each Acquire applies the access rules (see README) and returns an error that
+@@ -120,6 +120,7 @@ type ProjectScope interface {
+ 	Actor() ActorScope
+ 	Read() (ReadProject, error)
+ 	Write() (WriteProject, error)
++	Manage() (ManageProject, error)
+ 	Task(taskID string) TaskScope
+ }
+ 
+@@ -200,6 +201,28 @@ func (s *projectScope) Write() (WriteProject, error) {
+ 	return &writeProject{readProject: readProject{ps: s}, role: role}, nil
+ }
+ 
++// Manage applies the manager rule for project administration: readable, manager
++// (else 403), not archived (else 409). Org admins without a manager role get 403.
++func (s *projectScope) Manage() (ManageProject, error) {
++	err := s.as.a.st.read(func(st *state) error {
++		p, r, err := readable(st, s.as.actor, s.pid)
++		if err != nil {
++			return err
++		}
++		if r != RoleManager {
++			return deny(ErrForbidden, "forbidden")
++		}
++		if p.archived {
++			return deny(ErrArchived, "project is archived")
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &manageProject{readProject: readProject{ps: s}}, nil
++}
++
+ // ---- project capabilities ----------------------------------------------------
+ 
+ // ReadProject may list and read the tasks of one project.
+@@ -219,6 +242,15 @@ type WriteProject interface {
+ 	CreateTask(title string, assignee Assignee) (TaskView, error)
+ }
+ 
++// ManageProject may administer one project: remove its members.
++type ManageProject interface {
++	ReadProject
++	// RemoveMember removes userID from the project. A user who is not a member
++	// of this project is 404. Tasks of this project assigned to the removed user
++	// become unassigned, so the assignee invariant still holds.
++	RemoveMember(userID string) error
++}
++
+ type readProject struct{ ps *projectScope }
+ 
+ func (p *readProject) ID() string { return p.ps.pid }
+@@ -424,6 +456,25 @@ func (t *editTask) Apply(p TaskPatch) (TaskView, error) {
+ 	return v, err
+ }
+ 
++type manageProject struct{ readProject }
++
++func (p *manageProject) RemoveMember(userID string) error {
++	return p.ps.as.a.st.tx(func(s *state) error {
++		pid := p.ps.pid
++		if _, ok := s.members[pid][userID]; !ok {
++			return deny(ErrNotFound, "not found")
++		}
++		delete(s.members[pid], userID)
++		for id, t := range s.tasks {
++			if t.project == pid && t.assignee.user == userID {
++				t.assignee = Assignee{project: pid}
++				s.tasks[id] = t
++			}
++		}
++		return nil
++	})
++}
++
+ type manageTask struct{ editTask }
+ 
+ func (t *manageTask) Delete() error {
+diff --git a/main.go b/main.go
+index 29de540..0703e45 100644
+--- a/main.go
++++ b/main.go
+@@ -71,6 +71,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(authz), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Delete("/members/{uid}", tanukirpc.NewHandler(removeMember))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -177,6 +178,18 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++func removeMember(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*struct{}, error) {
++	p, err := ctx.Registry().scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	if err := p.RemoveMember(chi.URLParam(ctx.Request(), "uid")); err != nil {
++		return nil, err
++	}
++	ctx.Response().WriteHeader(http.StatusNoContent)
++	return nil, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // httpError is an error with an explicit status for request-shape problems
+diff --git a/members_test.go b/members_test.go
+new file mode 100644
+index 0000000..b7ad837
+--- /dev/null
++++ b/members_test.go
+@@ -0,0 +1,88 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestRemoveMember(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"manager removes contributor", "ann", "/projects/web/members/ben", 204},
++		{"manager removes viewer", "ann", "/projects/web/members/dan", 204},
++		{"contributor", "ben", "/projects/web/members/cat", 403},
++		{"viewer", "dan", "/projects/web/members/cat", 403},
++		{"org admin", "eve", "/projects/web/members/cat", 403},
++		{"non member", "hal", "/projects/web/members/cat", 404},
++		{"other org", "gus", "/projects/web/members/ann", 404},
++		{"anonymous", "", "/projects/web/members/cat", 401},
++		{"unknown user", "zed", "/projects/web/members/cat", 401},
++		{"target not a member", "ann", "/projects/web/members/hal", 404},
++		{"target unknown", "ann", "/projects/web/members/zed", 404},
++		{"archived", "ann", "/projects/legacy/members/ben", 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveMemberEffects(t *testing.T) {
++	h := newServer()
++
++	if code, _ := do(t, h, "DELETE", "/projects/web/members/cat", "ann", ""); code != 204 {
++		t.Fatalf("remove: got %d want 204", code)
++	}
++
++	// The removed user loses access to the project (404, not readable).
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "cat", ""); code != 404 {
++		t.Fatalf("removed user list: got %d want 404", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks/t2", "cat", ""); code != 404 {
++		t.Fatalf("removed user get task: got %d want 404", code)
++	}
++
++	// Removing again is a 404: the user is no longer a member.
++	if code, _ := do(t, h, "DELETE", "/projects/web/members/cat", "ann", ""); code != 404 {
++		t.Fatalf("second remove: got %d want 404", code)
++	}
++
++	// Tasks assigned to the removed user become unassigned; others are kept.
++	_, body := do(t, h, "GET", "/projects/web/tasks", "ann", "")
++	var tasks []Task
++	if err := json.Unmarshal([]byte(body), &tasks); err != nil {
++		t.Fatal(err)
++	}
++	byID := map[string]Task{}
++	for _, task := range tasks {
++		byID[task.ID] = task
++	}
++	if got := byID["t2"].Assignee; got != "" {
++		t.Fatalf("t2 assignee: got %q want unassigned", got)
++	}
++	if got := byID["t1"].Assignee; got != "ben" {
++		t.Fatalf("t1 assignee: got %q want ben", got)
++	}
++
++	// Membership is per project: cat is still a contributor of ops.
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks", "cat", ""); code != 200 {
++		t.Fatalf("cat ops list: got %d want 200", code)
++	}
++}
++
++func TestRemoveMemberAssignDenied(t *testing.T) {
++	// After removal the user is no longer an eligible assignee.
++	h := newServer()
++	if code, _ := do(t, h, "DELETE", "/projects/web/members/ben", "ann", ""); code != 204 {
++		t.Fatalf("remove: got %d want 204", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "ann", `{"title":"x","assignee":"ben"}`); code != 400 {
++		t.Fatalf("assign removed user: got %d want 400", code)
++	}
++}

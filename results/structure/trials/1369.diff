@@ -1,0 +1,357 @@
+diff --git a/README.md b/README.md
+index 5300749..ef66d13 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/tasks/{tid}/move` | `{"toProjectId"}` → 200 with the moved task (same ID, title, status, assignee) |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`. Request
+ bodies are JSON (`Content-Type: application/json`).
+@@ -35,7 +36,13 @@ bodies are JSON (`Content-Type: application/json`).
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
+-- Archived projects reject all writes with 409 (reads still work).
++- Only managers may move tasks, out of the project in the path. The target
++  project must be readable by the user (else 404) and the user must be a
++  `contributor` or `manager` there (else 403). Moving to the same project → 400.
++  The task keeps its assignee, who must be a `contributor` or `manager` of the
++  target project (else 400). Nothing changes on a 4xx.
++- Archived projects reject all writes with 409 (reads still work). This includes
++  moving a task out of an archived project or into one.
+ - A task ID that does not belong to the project in the path → 404.
+ 
+ ## Seed data
+@@ -77,7 +84,7 @@ Transformer "/projects/{pid}"   authenticates X-User, builds ProjectAuthz -> pro
+   object and an input:
+   `model.NewTaskTable().Create(ctx, reg.db, reg.authz, model.TaskTableCreateInput{...})`.
+   The operation asks the authorization object whether the accessor may
+-  perform it (`CanWrite`, `CanAssign`, `CanEdit`, `CanReassign`, `CanManage`);
++  perform it (`CanWrite`, `CanAssign`, `CanEdit`, `CanReassign`, `CanManage`, `CanMove`);
+   a denial is an error that maps onto the HTTP status convention
+   (`ErrUnauthenticated` 401, `ErrNotFound` 404, `ErrForbidden` 403,
+   `ErrArchived` 409, `ErrInvalid` 400).
+diff --git a/internal/model/aggregate.go b/internal/model/aggregate.go
+index e558654..ea80141 100644
+--- a/internal/model/aggregate.go
++++ b/internal/model/aggregate.go
+@@ -126,6 +126,48 @@ func (a *updateTaskAggregate) apply(ctx context.Context, tx DB) (*Task, error) {
+ 	return t, nil
+ }
+ 
++// moveTaskAggregate moves one task to another project. The assignee, if any,
++// must be a member of the target project with a writer role.
++type moveTaskAggregate struct {
++	task      *Task
++	toProject string
++	assignee  *Membership // the assignee's membership in the target project; nil when unassigned
++}
++
++func loadMoveTask(ctx context.Context, tx DB, taskID, toProjectID string) (*moveTaskAggregate, error) {
++	t, err := NewTaskTable().Find(ctx, tx, taskID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	a := &moveTaskAggregate{task: t, toProject: toProjectID}
++	if t.AssigneeID != "" {
++		m, err := NewMembershipTable().Find(ctx, tx, toProjectID, t.AssigneeID)
++		if errors.Is(err, ErrNoRows) {
++			return nil, deny(ErrInvalid, "assignee must be a contributor or manager of the project")
++		} else if err != nil {
++			return nil, err
++		}
++		a.assignee = m
++	}
++	return a, nil
++}
++
++func (a *moveTaskAggregate) validate() error {
++	if a.assignee != nil && !isWriterRole(a.assignee.Role) {
++		return deny(ErrInvalid, "assignee must be a contributor or manager of the project")
++	}
++	return nil
++}
++
++func (a *moveTaskAggregate) apply(ctx context.Context, tx DB) (*Task, error) {
++	if err := a.task.moveTo(ctx, tx, a.toProject); err != nil {
++		return nil, err
++	}
++	return a.task, nil
++}
++
+ // deleteTaskAggregate removes one task.
+ type deleteTaskAggregate struct {
+ 	task *Task
+diff --git a/internal/model/authz.go b/internal/model/authz.go
+index 89224a1..5159fd2 100644
+--- a/internal/model/authz.go
++++ b/internal/model/authz.go
+@@ -121,6 +121,25 @@ func (a TaskAuthz) CanManage() error {
+ 	return nil
+ }
+ 
++// CanMove returns nil if the actor may move the task to the target project
++// (built by NewProjectAuthz, so it is readable): managers of the task's project
++// only (else ErrForbidden); the task's project not archived (else ErrArchived);
++// the target is another project (else ErrInvalid); and the actor may write in
++// the target (see ProjectAuthz.CanWrite). The task's assignee must also be a
++// contributor or manager of the target; the table operation checks that.
++func (a TaskAuthz) CanMove(target ProjectAuthz) error {
++	if !a.CanRead() || a.project.role != RoleManager {
++		return deny(ErrForbidden, "only managers may move tasks")
++	}
++	if a.project.archived {
++		return deny(ErrArchived, "project is archived")
++	}
++	if target.ProjectID() == a.project.project {
++		return deny(ErrInvalid, "task is already in that project")
++	}
++	return target.CanWrite()
++}
++
+ // ---- building authorization objects -------------------------------------------------
+ 
+ // Authenticate resolves the X-User value. Unknown or missing users are 401.
+diff --git a/internal/model/record.go b/internal/model/record.go
+index b23b291..d3769ec 100644
+--- a/internal/model/record.go
++++ b/internal/model/record.go
+@@ -153,6 +153,12 @@ func (r *Task) unassign(ctx context.Context, db DB) error {
+ 	return r.save(ctx, db)
+ }
+ 
++// moveTo moves the task to another project.
++func (r *Task) moveTo(ctx context.Context, db DB, projectID string) error {
++	r.ProjectID = projectID
++	return r.save(ctx, db)
++}
++
+ // destroy deletes the task.
+ func (r *Task) destroy(ctx context.Context, db DB) error {
+ 	if _, err := db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, r.ID); err != nil {
+diff --git a/internal/model/task_table.go b/internal/model/task_table.go
+index 5ac0b03..46b74ce 100644
+--- a/internal/model/task_table.go
++++ b/internal/model/task_table.go
+@@ -183,3 +183,29 @@ func (*TaskTable) Delete(ctx context.Context, db DB, authz TaskAuthz) error {
+ 		return agg.apply(ctx, tx)
+ 	})
+ }
++
++// Move moves the task to the target project. The task keeps its ID, title,
++// status and assignee. The assignee must be a contributor or manager of the
++// target project (else ErrInvalid).
++func (*TaskTable) Move(ctx context.Context, db DB, authz TaskAuthz, target ProjectAuthz) (*Task, error) {
++	if err := authz.CanMove(target); err != nil {
++		return nil, err
++	}
++	var t *Task
++	if err := inTx(ctx, db, func(tx DB) error {
++		agg, err := loadMoveTask(ctx, tx, authz.TaskID(), target.ProjectID())
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		if t, err = agg.apply(ctx, tx); err != nil {
++			return err
++		}
++		return nil
++	}); err != nil {
++		return nil, err
++	}
++	return t, nil
++}
+diff --git a/main.go b/main.go
+index 5bcd29e..8674293 100644
+--- a/main.go
++++ b/main.go
+@@ -82,6 +82,7 @@ func newServer() http.Handler {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+ 			tr.Patch("/", tanukirpc.NewHandler(updateTask))
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
++			tr.Post("/move", tanukirpc.NewHandler(moveTask))
+ 		})
+ 	})
+ 	return r
+@@ -163,6 +164,22 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++type moveRequest struct {
++	ToProjectID string `json:"toProjectId" validate:"required"`
++}
++
++// moveTask moves the task to another project. The target project is read
++// through the same authorization object as the source (NewProjectAuthz), so an
++// unreadable or unknown target is 404.
++func moveTask(ctx tanukirpc.Context[*taskRegistry], req moveRequest) (*Task, error) {
++	reg := ctx.Registry()
++	target, err := model.NewProjectAuthz(ctx, reg.db, reg.authz.Project().Actor(), req.ToProjectID)
++	if err != nil {
++		return nil, err
++	}
++	return model.NewTaskTable().Move(ctx, reg.db, reg.authz, target)
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // jsonResponseCodec encodes responses as JSON even when the request has no
+diff --git a/main_test.go b/main_test.go
+index a54b0a8..a506e2a 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -116,6 +116,70 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestMove(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager to writable target", "ivy", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 200},
++		{"contributor source", "cat", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 403},
++		{"contributor cannot read target", "ben", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 404},
++		{"manager, viewer in target", "ann", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 403},
++		{"target unreadable (other org)", "ivy", "/projects/web/tasks/t2", `{"toProjectId":"gx"}`, 404},
++		{"target missing", "ivy", "/projects/web/tasks/t2", `{"toProjectId":"missing"}`, 404},
++		{"same project", "ivy", "/projects/web/tasks/t2", `{"toProjectId":"web"}`, 400},
++		{"assignee not in target", "ivy", "/projects/web/tasks/t1", `{"toProjectId":"ops"}`, 400},
++		{"target archived", "ann", "/projects/web/tasks/t2", `{"toProjectId":"legacy"}`, 409},
++		{"source archived", "ann", "/projects/legacy/tasks/t5", `{"toProjectId":"web"}`, 409},
++		{"task in other project", "ann", "/projects/web/tasks/t4", `{"toProjectId":"legacy"}`, 404},
++		{"empty target", "ivy", "/projects/web/tasks/t2", `{"toProjectId":""}`, 400},
++		{"missing body field", "ivy", "/projects/web/tasks/t2", `{}`, 400},
++		{"unknown user", "zed", "/projects/web/tasks/t2", `{"toProjectId":"ops"}`, 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path+"/move", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveKeepsTaskFields(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/projects/web/tasks/t2/move", "ivy", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("move: got %d: %s", code, body)
++	}
++	var moved Task
++	if err := json.Unmarshal([]byte(body), &moved); err != nil {
++		t.Fatal(err)
++	}
++	want := Task{ID: "t2", ProjectID: "ops", Title: "Update footer", Status: "doing", AssigneeID: "cat"}
++	if moved != want {
++		t.Fatalf("moved task = %+v, want %+v", moved, want)
++	}
++
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks/t2", "ivy", ""); code != 200 {
++		t.Fatalf("task not readable in target: %d", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks/t2", "ivy", ""); code != 404 {
++		t.Fatalf("task still readable in source: %d", code)
++	}
++	code, body = do(t, h, "GET", "/projects/ops/tasks", "ivy", "")
++	if code != 200 {
++		t.Fatal(code)
++	}
++	var tasks []Task
++	if err := json.Unmarshal([]byte(body), &tasks); err != nil {
++		t.Fatal(err)
++	}
++	if len(tasks) != 2 {
++		t.Fatalf("want 2 tasks in ops (t4 and the moved t2), got %d", len(tasks))
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string
+diff --git a/spec/taskboard.qnt b/spec/taskboard.qnt
+index fe78764..76eb22b 100644
+--- a/spec/taskboard.qnt
++++ b/spec/taskboard.qnt
+@@ -123,6 +123,23 @@ module taskboard {
+     else if (projects.get(p).archived) 409
+     else 204
+ 
++  // POST /projects/{pid}/tasks/{tid}/move {"toProjectId": toP}
++  // Only managers of the source project may move a task. The actor must be a
++  // contributor or manager of the target project. The assignee is kept, so it
++  // must already be a contributor or manager there (else 400).
++  def moveOutcome(u: UserId, p: ProjectId, t: TaskId, toP: ProjectId): int =
++    if (not(userExists(u))) 401
++    else if (not(canRead(u, p))) 404
++    else if (not(taskExists(t)) or tasks.get(t).project != p) 404
++    else if (not(canRead(u, toP))) 404
++    else if (roleOf(p, u) != "manager") 403
++    else if (projects.get(p).archived) 409
++    else if (toP == p) 400
++    else if (not(isWriter(toP, u))) 403
++    else if (projects.get(toP).archived) 409
++    else if (tasks.get(t).assignee != "" and not(isWriter(toP, tasks.get(t).assignee))) 400
++    else 200
++
+   // ---- actions -------------------------------------------------------------
+ 
+   action unchanged = all {
+@@ -164,6 +181,15 @@ module taskboard {
+       members' = members,
+     } else unchanged
+ 
++  action moveTask(u: UserId, p: ProjectId, t: TaskId, toP: ProjectId): bool =
++    if (moveOutcome(u, p, t, toP) == 200) all {
++      tasks' = tasks.set(t, { ...tasks.get(t), project: toP }),
++      nextTask' = nextTask,
++      users' = users,
++      projects' = projects,
++      members' = members,
++    } else unchanged
++
+   // ---- seed data and steps -------------------------------------------------
+ 
+   action init = all {
+@@ -198,6 +224,7 @@ module taskboard {
+   action step = {
+     nondet u = USERS.oneOf()
+     nondet p = PROJECTS.oneOf()
++    nondet toP = PROJECTS.oneOf()
+     nondet a = USERS.union(Set("")).oneOf()
+     nondet t = 1.to(nextTask).oneOf()
+     nondet s = STATUSES.oneOf()
+@@ -206,6 +233,7 @@ module taskboard {
+       createTask(u, p, a),
+       updateTask(u, p, t, s, changeAssignee, a),
+       deleteTask(u, p, t),
++      moveTask(u, p, t, toP),
+     }
+   }
+ 
+@@ -230,6 +258,16 @@ module taskboard {
+       assert(deleteOutcome("ann", "web", 1) == 204),
+       assert(deleteOutcome("ben", "web", 1) == 403),
+       assert(deleteOutcome("ann", "web", 4) == 404),
++      assert(moveOutcome("ben", "web", 1, "ops") == 404),
++      assert(moveOutcome("cat", "web", 2, "ops") == 403),
++      assert(moveOutcome("ann", "web", 1, "ops") == 403),
++      assert(moveOutcome("ivy", "web", 1, "ops") == 400),
++      assert(moveOutcome("ivy", "web", 2, "ops") == 200),
++      assert(moveOutcome("ivy", "web", 2, "web") == 400),
++      assert(moveOutcome("ann", "web", 2, "legacy") == 409),
++      assert(moveOutcome("ivy", "web", 2, "gx") == 404),
++      assert(moveOutcome("ivy", "web", 4, "ops") == 404),
++      assert(moveOutcome("ann", "web", 3, "ops") == 403),
+       unchanged,
+     })
+ }

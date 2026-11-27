@@ -1,0 +1,353 @@
+diff --git a/README.md b/README.md
+index 9cfa4e1..319dc93 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members/{uid}/move` | `{"toProjectId"}` → 200 `{"userId","projectId","role"}` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,12 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Moving a member (`POST .../members/{uid}/move`) requires the manager role in
++  both the source and the destination project; archived projects reject it
++  with 409. The user keeps their role. The user must be a member of the source
++  (else 404) and not already a member of the destination (else 400). Their
++  tasks in the source project are unassigned, since an assignee must be a
++  member of the task's project.
+ 
+ ## Seed data
+ 
+diff --git a/internal/capability/aggregate.go b/internal/capability/aggregate.go
+index 1c6ebfe..d7ca2e9 100644
+--- a/internal/capability/aggregate.go
++++ b/internal/capability/aggregate.go
+@@ -102,6 +102,52 @@ func (a *updateTaskAggregate) apply(x *tx) TaskView {
+ 	return t.view()
+ }
+ 
++// moveMemberAggregate moves one member from one project to another, keeping
++// the role. The member's tasks in the source project are unassigned, because
++// an assignee must be a member of the task's project.
++type moveMemberAggregate struct {
++	from       projectRecord
++	to         projectRecord
++	membership membershipRecord // the member's membership in from
++}
++
++func loadMoveMember(x *tx, fromID, toID, userID string) (*moveMemberAggregate, error) {
++	from, ok := x.findProject(fromID)
++	if !ok {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	to, ok := x.findProject(toID)
++	if !ok {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	m, ok := from.Membership(x, userID)
++	if !ok {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	if _, ok := to.Membership(x, userID); ok {
++		return nil, deny(ErrInvalid, "user is already a member of the destination project")
++	}
++	return &moveMemberAggregate{from: from, to: to, membership: m}, nil
++}
++
++func (a *moveMemberAggregate) validate() error {
++	if a.from.Org != a.to.Org {
++		return deny(ErrInvalid, "projects must belong to the same organization")
++	}
++	return nil
++}
++
++func (a *moveMemberAggregate) apply(x *tx) MemberView {
++	for _, t := range a.membership.AssignedTasks(x) {
++		t.Unassign(x)
++	}
++	a.membership.Destroy(x)
++	m := a.membership
++	m.ProjectID = a.to.ID
++	m.save(x)
++	return MemberView{UserID: m.UserID, ProjectID: m.ProjectID, Role: m.Role}
++}
++
+ // deleteTaskAggregate removes one task.
+ type deleteTaskAggregate struct {
+ 	task taskRecord
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index 7c9fde1..24bc1e6 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -5,7 +5,7 @@
+ // from them:
+ //
+ //	ActorScope   -> Project(pid) ProjectScope
+-//	ProjectScope -> Read() ReadProject | Write() WriteProject | Task(tid) TaskScope
++//	ProjectScope -> Read() ReadProject | Write() WriteProject | Manage() ManageProject | Task(tid) TaskScope
+ //	TaskScope    -> Read() ReadTask    | Edit() EditTask      | Manage() ManageTask
+ //
+ // Each Acquire applies the access rules (see README) and returns an error that
+@@ -57,6 +57,13 @@ type TaskView struct {
+ 	Assignee  string `json:"assignee"`
+ }
+ 
++// MemberView is the public representation of a project membership.
++type MemberView struct {
++	UserID    string `json:"userId"`
++	ProjectID string `json:"projectId"`
++	Role      string `json:"role"`
++}
++
+ // Assignee is an assignee that has been admitted for one specific project:
+ // either nobody, or a user who is a contributor or manager of that project.
+ // It can only be obtained from WriteProject.AdmitAssignee.
+@@ -117,6 +124,7 @@ type ProjectScope interface {
+ 	Actor() ActorScope
+ 	Read() (ReadProject, error)
+ 	Write() (WriteProject, error)
++	Manage() (ManageProject, error)
+ 	Task(taskID string) TaskScope
+ }
+ 
+@@ -197,6 +205,28 @@ func (s *projectScope) Write() (WriteProject, error) {
+ 	return &writeProject{readProject: readProject{ps: s}, role: role}, nil
+ }
+ 
++// Manage applies the manager rule: readable, manager (else 403), not archived
++// (else 409).
++func (s *projectScope) Manage() (ManageProject, error) {
++	err := s.as.a.db.view(func(x *tx) error {
++		p, r, err := readable(x, s.as.actor, s.pid)
++		if err != nil {
++			return err
++		}
++		if r != RoleManager {
++			return deny(ErrForbidden, "forbidden")
++		}
++		if p.Archived {
++			return deny(ErrArchived, "project is archived")
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &manageProject{readProject: readProject{ps: s}}, nil
++}
++
+ // ---- project capabilities ----------------------------------------------------
+ 
+ // ReadProject may list and read the tasks of one project.
+@@ -277,6 +307,42 @@ func (p *writeProject) CreateTask(title string, assignee Assignee) (TaskView, er
+ 	return v, err
+ }
+ 
++// ManageProject may change the membership of one project. Only managers may.
++type ManageProject interface {
++	ReadProject
++	// MoveMember moves a member of this project into the destination project,
++	// keeping their role. The destination must be a ManageProject too, so the
++	// caller must manage both projects. The member's tasks in this project are
++	// unassigned. Errors: 404 if userID is not a member here, 400 if the
++	// destination is this project or the user is already in it.
++	MoveMember(userID string, to ManageProject) (MemberView, error)
++}
++
++type manageProject struct{ readProject }
++
++func (p *manageProject) MoveMember(userID string, to ManageProject) (MemberView, error) {
++	dst, ok := to.(*manageProject)
++	if !ok {
++		return MemberView{}, deny(ErrInvalid, "destination is not a managed project")
++	}
++	if dst.ps.pid == p.ps.pid {
++		return MemberView{}, deny(ErrInvalid, "destination must be another project")
++	}
++	var v MemberView
++	err := p.ps.as.a.db.update(func(x *tx) error {
++		agg, err := loadMoveMember(x, p.ps.pid, dst.ps.pid, userID)
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		v = agg.apply(x)
++		return nil
++	})
++	return v, err
++}
++
+ // ---- task capabilities ---------------------------------------------------------
+ 
+ // ReadTask may read one task.
+diff --git a/internal/capability/record.go b/internal/capability/record.go
+index 81e41cd..6b11102 100644
+--- a/internal/capability/record.go
++++ b/internal/capability/record.go
+@@ -264,6 +264,9 @@ func (r *taskRecord) SetStatus(x *tx, status string) {
+ 	r.save(x)
+ }
+ 
++// Destroy removes the membership.
++func (r membershipRecord) Destroy(x *tx) { delete(x.t.members[r.ProjectID], r.UserID) }
++
+ // Assign makes the member the task's assignee.
+ func (r *taskRecord) Assign(x *tx, m membershipRecord) {
+ 	r.AssigneeID = m.UserID
+diff --git a/main.go b/main.go
+index f7443f1..027e8ff 100644
+--- a/main.go
++++ b/main.go
+@@ -71,6 +71,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(authz), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Post("/members/{uid}/move", tanukirpc.NewHandler(moveMember))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -177,6 +178,33 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++type moveRequest struct {
++	ToProjectID string `json:"toProjectId"`
++}
++
++// moveMember moves {uid} from {pid} to toProjectId. The caller must manage both
++// projects. Acquiring the source first means access errors on it take
++// precedence over body errors.
++func moveMember(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*capability.MemberView, error) {
++	from, err := ctx.Registry().scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	var req moveRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil || req.ToProjectID == "" {
++		return nil, errInvalidBody
++	}
++	to, err := ctx.Registry().scope.Actor().Project(req.ToProjectID).Manage()
++	if err != nil {
++		return nil, err
++	}
++	v, err := from.MoveMember(chi.URLParam(ctx.Request(), "uid"), to)
++	if err != nil {
++		return nil, err
++	}
++	return &v, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // httpError is an error with an explicit status for request-shape problems
+diff --git a/main_move_test.go b/main_move_test.go
+new file mode 100644
+index 0000000..773891e
+--- /dev/null
++++ b/main_move_test.go
+@@ -0,0 +1,98 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++
++	"taskboard/internal/capability"
++)
++
++func TestMoveAccess(t *testing.T) {
++	const toOps = `{"toProjectId":"ops"}`
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager of both moves", "ivy", "/projects/web/members/ben/move", toOps, 200},
++		{"contributor", "ben", "/projects/web/members/cat/move", toOps, 403},
++		{"viewer", "dan", "/projects/web/members/ben/move", toOps, 403},
++		{"org admin", "eve", "/projects/web/members/ben/move", toOps, 403},
++		{"non member", "hal", "/projects/web/members/ben/move", toOps, 404},
++		{"other org", "gus", "/projects/web/members/ben/move", toOps, 404},
++		{"anonymous", "", "/projects/web/members/ben/move", toOps, 401},
++		{"manager of source only", "ann", "/projects/web/members/ben/move", toOps, 403},
++		{"destination missing", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"nope"}`, 404},
++		{"destination other org", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"gx"}`, 404},
++		{"destination is source", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"web"}`, 400},
++		{"destination archived", "ann", "/projects/web/members/ben/move", `{"toProjectId":"legacy"}`, 409},
++		{"source archived", "ann", "/projects/legacy/members/ben/move", `{"toProjectId":"web"}`, 409},
++		{"user not in source", "ivy", "/projects/web/members/hal/move", toOps, 404},
++		{"user already in destination", "ivy", "/projects/web/members/cat/move", toOps, 400},
++		{"empty destination", "ivy", "/projects/web/members/ben/move", `{}`, 400},
++		{"bad body", "ivy", "/projects/web/members/ben/move", `not json`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveEffects(t *testing.T) {
++	h := newServer()
++
++	code, body := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("move: got %d: %s", code, body)
++	}
++	var got capability.MemberView
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := capability.MemberView{UserID: "ben", ProjectID: "ops", Role: "contributor"}
++	if got != want {
++		t.Fatalf("response: got %+v want %+v", got, want)
++	}
++
++	// ben left web: no longer readable there.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("ben in web after move: got %d want 404", code)
++	}
++	// ben joined ops with the same role: can read and write there.
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks", "ben", ""); code != 200 {
++		t.Fatalf("ben in ops after move: got %d want 200", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/ops/tasks", "ben", `{"title":"x"}`); code != 201 {
++		t.Fatalf("ben create in ops: got %d want 201", code)
++	}
++
++	// t1 was ben's task in web; it is unassigned now, and still in web.
++	code, body = do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
++	if code != 200 {
++		t.Fatalf("get t1: got %d", code)
++	}
++	var task Task
++	if err := json.Unmarshal([]byte(body), &task); err != nil {
++		t.Fatal(err)
++	}
++	if task.Assignee != "" || task.ProjectID != "web" {
++		t.Fatalf("t1 after move: got assignee %q project %q", task.Assignee, task.ProjectID)
++	}
++}
++
++func TestMoveKeepsRole(t *testing.T) {
++	code, body := do(t, newServer(), "POST", "/projects/web/members/dan/move", "ivy", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var got capability.MemberView
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	if got.Role != "viewer" || got.ProjectID != "ops" {
++		t.Fatalf("got %+v want viewer in ops", got)
++	}
++}

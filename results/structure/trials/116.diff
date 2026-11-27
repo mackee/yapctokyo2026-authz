@@ -1,0 +1,209 @@
+diff --git a/README.md b/README.md
+index 8d54490..4f88e79 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,12 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Creating a task with an `assignee` who is not yet a member of the project
++  adds that user to the project as a `contributor` in the same write, so the
++  task and the membership are created together. The user must belong to the
++  project's organization (otherwise 400, as for unknown users). Contributors
++  may not create tasks for other users, so only managers trigger this.
++  Reassigning an existing task (PATCH) still requires an existing member.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..a7ff46d 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -63,9 +63,14 @@ type TaskView struct {
+ // It can only be obtained from WriteProject.AdmitAssignee (or ManageTask), and
+ // a task can only hold an Assignee admitted for the task's own project; the
+ // store rejects any commit that violates this.
++//
++// An Assignee may also be admitted for a user who is not yet a member of the
++// project (joins). Such a user becomes a contributor in the same transaction
++// that creates the task, so the invariant above still holds at every commit.
+ type Assignee struct {
+ 	project string
+ 	user    string
++	joins   bool
+ }
+ 
+ // User returns the admitted user ID ("" means unassigned).
+@@ -213,9 +218,12 @@ type WriteProject interface {
+ 	ReadProject
+ 	Role() string
+ 	// AdmitAssignee returns an Assignee for this project. "" admits nobody.
+-	// A user who is not a contributor or manager of this project is 400.
++	// A user of the project's organization who is not yet a member is admitted
++	// and joins as a contributor when the task is created. A viewer member, a
++	// user of another organization, or an unknown user is 400.
+ 	AdmitAssignee(userID string) (Assignee, error)
+ 	// CreateTask creates a task. Contributors may only assign themselves (403).
++	// An admitted new member is added as a contributor in the same commit.
+ 	CreateTask(title string, assignee Assignee) (TaskView, error)
+ }
+ 
+@@ -245,11 +253,50 @@ func admit(s *state, pid, userID string) (Assignee, error) {
+ 	return Assignee{project: pid, user: userID}, nil
+ }
+ 
++// admitNew is admit for task creation. A user of the project's organization
++// who is not yet a member is admitted with joins set; they become a
++// contributor in the creating transaction.
++func admitNew(s *state, pid, userID string) (Assignee, error) {
++	if userID != "" && s.role(pid, userID) == "" {
++		if !inOrg(s, pid, userID) {
++			return Assignee{}, deny(ErrInvalid, "assignee must be a user of the project's organization")
++		}
++		return Assignee{project: pid, user: userID, joins: true}, nil
++	}
++	return admit(s, pid, userID)
++}
++
++// inOrg reports whether userID is a known user of the organization that owns pid.
++func inOrg(s *state, pid, userID string) bool {
++	u, ok := s.users[userID]
++	return ok && u.org == s.projects[pid].org
++}
++
++// joinAsContributor makes userID a contributor of pid, unless they already
++// have a role there. It runs inside store.tx, so the membership and the task
++// that needs it commit together or not at all.
++func joinAsContributor(s *state, pid, userID string) error {
++	if r := s.role(pid, userID); r != "" {
++		if !isWriterRole(r) {
++			return deny(ErrInvalid, "assignee must be a contributor or manager of the project")
++		}
++		return nil
++	}
++	if !inOrg(s, pid, userID) {
++		return deny(ErrInvalid, "assignee must be a user of the project's organization")
++	}
++	if s.members[pid] == nil {
++		s.members[pid] = map[string]string{}
++	}
++	s.members[pid][userID] = RoleContributor
++	return nil
++}
++
+ func (p *writeProject) AdmitAssignee(userID string) (Assignee, error) {
+ 	var a Assignee
+ 	err := p.ps.as.a.st.read(func(s *state) error {
+ 		var err error
+-		a, err = admit(s, p.ps.pid, userID)
++		a, err = admitNew(s, p.ps.pid, userID)
+ 		return err
+ 	})
+ 	return a, err
+@@ -267,7 +314,14 @@ func (p *writeProject) CreateTask(title string, assignee Assignee) (TaskView, er
+ 	}
+ 	var v TaskView
+ 	err := p.ps.as.a.st.tx(func(s *state) error {
+-		t := task{id: s.newTaskID(), project: p.ps.pid, title: title, status: "open", assignee: assignee}
++		if assignee.joins {
++			if err := joinAsContributor(s, p.ps.pid, assignee.user); err != nil {
++				return err
++			}
++		}
++		// The stored assignee is a plain admitted member, not a pending join.
++		held := Assignee{project: p.ps.pid, user: assignee.user}
++		t := task{id: s.newTaskID(), project: p.ps.pid, title: title, status: "open", assignee: held}
+ 		s.tasks[t.id] = t
+ 		v = t.view()
+ 		return nil
+diff --git a/main_test.go b/main_test.go
+index 0277f51..b42345a 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -76,6 +76,12 @@ func TestCreate(t *testing.T) {
+ 		{"archived", "ann", "legacy", `{"title":"x"}`, 409},
+ 		{"empty title", "ann", "web", `{"title":""}`, 400},
+ 		{"assignee viewer", "ann", "web", `{"title":"x","assignee":"dan"}`, 400},
++		{"manager assigns non-member", "ann", "web", `{"title":"x","assignee":"hal"}`, 201},
++		{"manager assigns non-member org admin", "ann", "web", `{"title":"x","assignee":"eve"}`, 201},
++		{"contributor assigns non-member", "ben", "web", `{"title":"x","assignee":"hal"}`, 403},
++		{"assignee unknown user", "ann", "web", `{"title":"x","assignee":"nobody"}`, 400},
++		{"assignee other org", "ann", "web", `{"title":"x","assignee":"gus"}`, 400},
++		{"archived non-member", "ann", "legacy", `{"title":"x","assignee":"hal"}`, 409},
+ 	}
+ 	for _, c := range cases {
+ 		t.Run(c.name, func(t *testing.T) {
+@@ -87,6 +93,73 @@ func TestCreate(t *testing.T) {
+ 	}
+ }
+ 
++// A manager may assign a task to a user of the organization who is not yet in
++// the project. That user joins as a contributor, atomically with the task.
++func TestCreateAddsNonMemberAsContributor(t *testing.T) {
++	srv := newServer()
++
++	code, body := do(t, srv, "POST", "/projects/web/tasks", "ann", `{"title":"new","assignee":"hal"}`)
++	if code != 201 {
++		t.Fatalf("create: got %d want 201 (%s)", code, body)
++	}
++	var created Task
++	if err := json.Unmarshal([]byte(body), &created); err != nil {
++		t.Fatal(err)
++	}
++	if created.ProjectID != "web" || created.Assignee != "hal" {
++		t.Fatalf("unexpected task %+v", created)
++	}
++
++	// hal is now a project member: can read the project...
++	if code, body := do(t, srv, "GET", "/projects/web/tasks", "hal", ""); code != 200 {
++		t.Fatalf("hal list: got %d want 200 (%s)", code, body)
++	}
++	// ...can edit the task assigned to them as a contributor...
++	if code, body := do(t, srv, "PATCH", "/projects/web/tasks/"+created.ID, "hal", `{"status":"done"}`); code != 200 {
++		t.Fatalf("hal patch own task: got %d want 200 (%s)", code, body)
++	}
++	// ...and can create tasks for themselves.
++	if code, body := do(t, srv, "POST", "/projects/web/tasks", "hal", `{"title":"mine","assignee":"hal"}`); code != 201 {
++		t.Fatalf("hal create: got %d want 201 (%s)", code, body)
++	}
++	// Contributor limits still apply: hal cannot reassign others' tasks.
++	if code, body := do(t, srv, "PATCH", "/projects/web/tasks/t2", "hal", `{"status":"done"}`); code != 403 {
++		t.Fatalf("hal patch others' task: got %d want 403 (%s)", code, body)
++	}
++
++	// Assigning the same user again is now an ordinary member assignment.
++	if code, body := do(t, srv, "POST", "/projects/web/tasks", "ann", `{"title":"again","assignee":"hal"}`); code != 201 {
++		t.Fatalf("second assign: got %d want 201 (%s)", code, body)
++	}
++
++	// The join is visible to other projects: hal is still not a member of ops.
++	if code, _ := do(t, srv, "GET", "/projects/ops/tasks", "hal", ""); code != 404 {
++		t.Fatalf("hal in ops: got %d want 404", code)
++	}
++}
++
++// A rejected create must not leave the assignee behind as a member.
++func TestCreateRejectedDoesNotJoin(t *testing.T) {
++	cases := []struct {
++		name, user, body string
++		want             int
++	}{
++		{"contributor assigns non-member", "ben", `{"title":"x","assignee":"hal"}`, 403},
++		{"unknown user", "ann", `{"title":"x","assignee":"hal2"}`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			srv := newServer()
++			if code, _ := do(t, srv, "POST", "/projects/web/tasks", c.user, c.body); code != c.want {
++				t.Fatalf("create: got %d want %d", code, c.want)
++			}
++			if code, _ := do(t, srv, "GET", "/projects/web/tasks", "hal", ""); code != 404 {
++				t.Fatalf("hal list after rejected create: got %d want 404", code)
++			}
++		})
++	}
++}
++
+ func TestUpdate(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path, body string

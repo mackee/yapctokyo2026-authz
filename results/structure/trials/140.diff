@@ -1,0 +1,197 @@
+diff --git a/README.md b/README.md
+index 8d54490..13b1327 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| GET | `/search/tasks?q=` | tasks whose title contains `q` (case-insensitive) across all projects the caller can read; each has `projectId`; empty `q` → 400 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..fd9bd67 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -19,6 +19,8 @@ package capability
+ 
+ import (
+ 	"errors"
++	"sort"
++	"strings"
+ )
+ 
+ // Project roles.
+@@ -111,6 +113,7 @@ func (a *Authorizer) Authenticate(userID string) (ActorScope, error) {
+ type ActorScope interface {
+ 	Actor() Actor
+ 	Project(projectID string) ProjectScope
++	Search() SearchTasks
+ }
+ 
+ // ProjectScope is bound to one actor and one project ID. It grants nothing by
+@@ -139,6 +142,41 @@ func (s *actorScope) Actor() Actor { return s.actor }
+ func (s *actorScope) Project(projectID string) ProjectScope {
+ 	return &projectScope{as: s, pid: projectID}
+ }
++func (s *actorScope) Search() SearchTasks { return &searchTasks{as: s} }
++
++// SearchTasks may search the tasks of every project the actor can read.
++type SearchTasks interface {
++	// Find returns the tasks whose title contains q (case-insensitive), across
++	// all projects that pass the read rule, sorted by ID. Projects the actor
++	// cannot read contribute nothing. An empty q is 400.
++	Find(q string) ([]TaskView, error)
++}
++
++type searchTasks struct{ as *actorScope }
++
++func (s *searchTasks) Find(q string) ([]TaskView, error) {
++	if q == "" {
++		return nil, deny(ErrInvalid, "q is required")
++	}
++	needle := strings.ToLower(q)
++	out := []TaskView{}
++	err := s.as.a.st.read(func(st *state) error {
++		for _, t := range st.tasks {
++			if _, _, err := readable(st, s.as.actor, t.project); err != nil {
++				continue
++			}
++			if strings.Contains(strings.ToLower(t.title), needle) {
++				out = append(out, t.view())
++			}
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
++	return out, nil
++}
+ 
+ type projectScope struct {
+ 	as  *actorScope
+diff --git a/main.go b/main.go
+index 29de540..7cd653e 100644
+--- a/main.go
++++ b/main.go
+@@ -46,6 +46,11 @@ type taskRegistry struct {
+ 	scope capability.TaskScope
+ }
+ 
++// searchRegistry is the handler-visible surface under /search.
++type searchRegistry struct {
++	scope capability.ActorScope
++}
++
+ func init() {
+ 	// tanukirpc logs every request through the default slog logger; keep the
+ 	// demo and test output quiet.
+@@ -78,9 +83,24 @@ func newServer() http.Handler {
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
+ 		})
+ 	})
++
++	tanukirpc.RouteWithTransformer(r, actorTransformer(authz), "/search", func(sr *tanukirpc.Router[*searchRegistry]) {
++		sr.Get("/tasks", tanukirpc.NewHandler(searchTaskList))
++	})
+ 	return r
+ }
+ 
++// actorTransformer authenticates the caller and hands out an ActorScope.
++func actorTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*rootRegistry, *searchRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*rootRegistry]) (*searchRegistry, error) {
++		actor, err := authz.Authenticate(ctx.Request().Header.Get("X-User"))
++		if err != nil {
++			return nil, err
++		}
++		return &searchRegistry{scope: actor}, nil
++	})
++}
++
+ // projectTransformer authenticates the caller and binds the scope to {pid}.
+ // The Authorizer stays in this closure; it is never put in a registry.
+ func projectTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*rootRegistry, *projectRegistry] {
+@@ -109,6 +129,15 @@ func listTasks(ctx tanukirpc.Context[*projectRegistry], _ struct{}) ([]Task, err
+ 	return p.Tasks(), nil
+ }
+ 
++// searchTaskList handles GET /search/tasks?q=... across every readable project.
++func searchTaskList(ctx tanukirpc.Context[*searchRegistry], _ struct{}) ([]Task, error) {
++	tasks, err := ctx.Registry().scope.Search().Find(ctx.Request().URL.Query().Get("q"))
++	if err != nil {
++		return nil, err
++	}
++	return tasks, nil
++}
++
+ type createRequest struct {
+ 	Title    string `json:"title"`
+ 	Assignee string `json:"assignee"`
+diff --git a/main_test.go b/main_test.go
+index 0277f51..188abe4 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,60 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestSearchTasks(t *testing.T) {
++	// Seed data: t1 "Fix header" (web), t4 "Rotate keys" (ops),
++	// t5 "Old bug" (legacy, archived), t6 "Globex secret plan" (gx, globex).
++	projectOf := map[string]string{"t1": "web", "t4": "ops", "t5": "legacy", "t6": "gx"}
++	cases := []struct {
++		name, user, query string
++		want              int
++		ids               []string
++	}{
++		{"member finds across own project", "ben", "q=header", 200, []string{"t1"}},
++		{"viewer member finds", "dan", "q=header", 200, []string{"t1"}},
++		{"case insensitive", "dan", "q=HEADER", 200, []string{"t1"}},
++		{"viewer of ops finds ops task", "ann", "q=keys", 200, []string{"t4"}},
++		{"archived project is readable", "ann", "q=old", 200, []string{"t5"}},
++		{"org admin finds any acme project", "eve", "q=keys", 200, []string{"t4"}},
++		{"non member finds nothing", "hal", "q=keys", 200, []string{}},
++		{"other org finds nothing in acme", "gus", "q=header", 200, []string{}},
++		{"other org finds own project", "gus", "q=secret", 200, []string{"t6"}},
++		{"no match is empty array", "ben", "q=zzz", 200, []string{}},
++		{"missing q", "ben", "", 400, nil},
++		{"empty q", "ben", "q=", 400, nil},
++		{"anonymous", "", "q=header", 401, nil},
++		{"unknown user", "zed", "q=header", 401, nil},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, body := do(t, newServer(), "GET", "/search/tasks?"+c.query, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d (body %s)", code, c.want, body)
++			}
++			if c.want != 200 {
++				return
++			}
++			var tasks []Task
++			if err := json.Unmarshal([]byte(body), &tasks); err != nil {
++				t.Fatalf("decode: %v (body %s)", err, body)
++			}
++			if tasks == nil {
++				t.Fatalf("want a JSON array, got %s", body)
++			}
++			var got []string
++			for _, task := range tasks {
++				got = append(got, task.ID)
++				if task.ProjectID != projectOf[task.ID] {
++					t.Fatalf("task %s: projectId %q, want %q", task.ID, task.ProjectID, projectOf[task.ID])
++				}
++			}
++			if strings.Join(got, ",") != strings.Join(c.ids, ",") {
++				t.Fatalf("got ids %v want %v", got, c.ids)
++			}
++		})
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

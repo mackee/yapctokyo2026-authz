@@ -1,0 +1,216 @@
+diff --git a/README.md b/README.md
+index 3fe8794..c0d7329 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| DELETE | `/projects/{pid}/members/{uid}` | remove the user from the project → 204 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`. Request
+ bodies are JSON (`Content-Type: application/json`).
+@@ -35,6 +36,9 @@ bodies are JSON (`Content-Type: application/json`).
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Only managers may remove project members; a user who is not a member → 404.
++  A member who is assigned tasks in the project cannot be removed → 400 until
++  those tasks are reassigned or unassigned.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/internal/model/aggregate.go b/internal/model/aggregate.go
+index e558654..2dd6b9b 100644
+--- a/internal/model/aggregate.go
++++ b/internal/model/aggregate.go
+@@ -144,3 +144,34 @@ func loadDeleteTask(ctx context.Context, tx DB, taskID string) (*deleteTaskAggre
+ func (a *deleteTaskAggregate) validate() error { return nil }
+ 
+ func (a *deleteTaskAggregate) apply(ctx context.Context, tx DB) error { return a.task.destroy(ctx, tx) }
++
++// removeMemberAggregate removes one member from one project.
++type removeMemberAggregate struct {
++	membership *Membership
++	assigned   []*Task // the member's tasks in the project; must be none
++}
++
++func loadRemoveMember(ctx context.Context, tx DB, projectID, userID string) (*removeMemberAggregate, error) {
++	m, err := NewMembershipTable().Find(ctx, tx, projectID, userID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	tasks, err := m.AssignedTasks(ctx, tx)
++	if err != nil {
++		return nil, err
++	}
++	return &removeMemberAggregate{membership: m, assigned: tasks}, nil
++}
++
++func (a *removeMemberAggregate) validate() error {
++	if len(a.assigned) > 0 {
++		return deny(ErrInvalid, "member is assigned tasks in the project; reassign or unassign them first")
++	}
++	return nil
++}
++
++func (a *removeMemberAggregate) apply(ctx context.Context, tx DB) error {
++	return a.membership.destroy(ctx, tx)
++}
+diff --git a/internal/model/authz.go b/internal/model/authz.go
+index 89224a1..279d5ce 100644
+--- a/internal/model/authz.go
++++ b/internal/model/authz.go
+@@ -58,6 +58,18 @@ func (a ProjectAuthz) CanWrite() error {
+ 	return nil
+ }
+ 
++// CanManageMembers returns nil if the actor may remove members from the project:
++// managers only (else ErrForbidden) and not archived (else ErrArchived).
++func (a ProjectAuthz) CanManageMembers() error {
++	if !a.CanRead() || a.role != RoleManager {
++		return deny(ErrForbidden, "only managers may remove members")
++	}
++	if a.archived {
++		return deny(ErrArchived, "project is archived")
++	}
++	return nil
++}
++
+ // CanAssign returns nil if the actor may make userID the assignee of a new
+ // task: contributors may only assign themselves (else ErrForbidden).
+ func (a ProjectAuthz) CanAssign(userID string) error {
+diff --git a/internal/model/membership_table.go b/internal/model/membership_table.go
+index 3e01344..e009b60 100644
+--- a/internal/model/membership_table.go
++++ b/internal/model/membership_table.go
+@@ -32,6 +32,27 @@ func (mt *MembershipTable) ListByUser(ctx context.Context, db DB, userID string)
+ 		`SELECT project_id, user_id, role FROM memberships WHERE user_id = ? ORDER BY project_id`, userID)
+ }
+ 
++// Delete removes the user from the project. Only managers may do it (else
++// ErrForbidden), and not in an archived project (else ErrArchived). A user who
++// is not a member is ErrNotFound. A member who is assigned tasks in the project
++// cannot be removed: the assignee rule would break, so the write is rejected
++// (ErrInvalid) and nothing changes.
++func (mt *MembershipTable) Delete(ctx context.Context, db DB, authz ProjectAuthz, userID string) error {
++	if err := authz.CanManageMembers(); err != nil {
++		return err
++	}
++	return inTx(ctx, db, func(tx DB) error {
++		agg, err := loadRemoveMember(ctx, tx, authz.ProjectID(), userID)
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		return agg.apply(ctx, tx)
++	})
++}
++
+ func (*MembershipTable) list(ctx context.Context, db DB, query string, args ...any) ([]*Membership, error) {
+ 	rows, err := db.QueryContext(ctx, query, args...)
+ 	if err != nil {
+diff --git a/internal/model/record.go b/internal/model/record.go
+index b23b291..4f422ad 100644
+--- a/internal/model/record.go
++++ b/internal/model/record.go
+@@ -185,6 +185,15 @@ func (r *Project) save(ctx context.Context, db DB) error {
+ 	return nil
+ }
+ 
++// destroy removes the membership.
++func (r *Membership) destroy(ctx context.Context, db DB) error {
++	if _, err := db.ExecContext(ctx,
++		`DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, r.ProjectID, r.UserID); err != nil {
++		return err
++	}
++	return nil
++}
++
+ func (r *Membership) save(ctx context.Context, db DB) error {
+ 	if _, err := db.ExecContext(ctx,
+ 		`INSERT INTO memberships (project_id, user_id, role) VALUES (?, ?, ?)
+diff --git a/main.go b/main.go
+index cfe3d30..b8fe7e6 100644
+--- a/main.go
++++ b/main.go
+@@ -77,6 +77,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(conn), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Delete("/members/{uid}", tanukirpc.NewHandler(removeMember))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -170,6 +171,15 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++func removeMember(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*struct{}, error) {
++	reg := ctx.Registry()
++	if err := model.NewMembershipTable().Delete(ctx, reg.db, reg.authz, chi.URLParam(ctx.Request(), "uid")); err != nil {
++		return nil, err
++	}
++	ctx.Response().WriteHeader(http.StatusNoContent)
++	return nil, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // jsonResponseCodec encodes responses as JSON even when the request has no
+diff --git a/main_test.go b/main_test.go
+index 190ea41..78ef0f6 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -119,6 +119,47 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestRemoveMember(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"manager removes viewer", "ann", "/projects/web/members/dan", 204},
++		{"manager removes manager", "ann", "/projects/web/members/ivy", 204},
++		{"manager, member has assigned tasks", "ann", "/projects/web/members/ben", 400},
++		{"manager, not a member", "ann", "/projects/web/members/gus", 404},
++		{"manager, unknown user", "ann", "/projects/web/members/zed", 404},
++		{"manager, archived project", "ann", "/projects/legacy/members/ben", 409},
++		{"contributor", "ben", "/projects/web/members/dan", 403},
++		{"viewer", "dan", "/projects/web/members/ivy", 403},
++		{"org admin", "eve", "/projects/web/members/dan", 403},
++		{"non member", "hal", "/projects/web/members/dan", 404},
++		{"other org", "gus", "/projects/web/members/dan", 404},
++		{"anonymous", "", "/projects/web/members/dan", 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveMemberTakesEffect(t *testing.T) {
++	srv := newServer()
++	if code, _ := do(t, srv, "DELETE", "/projects/web/members/dan", "ann", ""); code != 204 {
++		t.Fatalf("remove: got %d want 204", code)
++	}
++	if code, _ := do(t, srv, "GET", "/projects/web/tasks", "dan", ""); code != 404 {
++		t.Fatalf("removed member still reads the project: got %d want 404", code)
++	}
++	if code, _ := do(t, srv, "DELETE", "/projects/web/members/dan", "ann", ""); code != 404 {
++		t.Fatalf("second remove: got %d want 404", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

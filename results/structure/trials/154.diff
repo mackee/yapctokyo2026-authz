@@ -1,0 +1,269 @@
+diff --git a/README.md b/README.md
+index 8d54490..6387a6a 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members` | `{"userId","role"}` (`manager`/`contributor`/`viewer`) → 201 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -30,6 +31,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Only managers may add project members. Adding a user who is already a member → 409; an unknown user, a user outside the project's organization, or an invalid role → 400.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..3117726 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -36,6 +36,7 @@ var (
+ 	ErrNotFound        = errors.New("not found")           // 404 (also used for "not readable")
+ 	ErrForbidden       = errors.New("forbidden")           // 403
+ 	ErrArchived        = errors.New("project is archived") // 409
++	ErrConflict        = errors.New("conflict")            // 409
+ 	ErrInvalid         = errors.New("invalid request")     // 400
+ )
+ 
+@@ -58,6 +59,12 @@ type TaskView struct {
+ 	Assignee  string `json:"assignee"`
+ }
+ 
++// MemberView is the public representation of a project member.
++type MemberView struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
+ // Assignee is an assignee that has been admitted for one specific project:
+ // either nobody, or a user who is a contributor or manager of that project.
+ // It can only be obtained from WriteProject.AdmitAssignee (or ManageTask), and
+@@ -114,12 +121,13 @@ type ActorScope interface {
+ }
+ 
+ // ProjectScope is bound to one actor and one project ID. It grants nothing by
+-// itself; call Read/Write/Task to acquire a capability.
++// itself; call Read/Write/Manage/Task to acquire a capability.
+ type ProjectScope interface {
+ 	ID() string
+ 	Actor() ActorScope
+ 	Read() (ReadProject, error)
+ 	Write() (WriteProject, error)
++	Manage() (ManageProject, error)
+ 	Task(taskID string) TaskScope
+ }
+ 
+@@ -151,6 +159,28 @@ func (s *projectScope) Task(taskID string) TaskScope {
+ 	return &taskScope{ps: s, tid: taskID}
+ }
+ 
++// Manage applies the manage rule: readable, manager only (else 403), not
++// archived (else 409). Org admins without a manager role get 403.
++func (s *projectScope) Manage() (ManageProject, error) {
++	err := s.as.a.st.read(func(st *state) error {
++		p, r, err := readable(st, s.as.actor, s.pid)
++		if err != nil {
++			return err
++		}
++		if r != RoleManager {
++			return deny(ErrForbidden, "forbidden")
++		}
++		if p.archived {
++			return deny(ErrArchived, "project is archived")
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &manageProject{readProject: readProject{ps: s}}, nil
++}
++
+ // readable applies the read rule: the project exists, is in the actor's org,
+ // and the actor is a member (any role) or an org admin. Otherwise 404.
+ func readable(s *state, act Actor, pid string) (project, string, error) {
+@@ -219,6 +249,15 @@ type WriteProject interface {
+ 	CreateTask(title string, assignee Assignee) (TaskView, error)
+ }
+ 
++// ManageProject may manage the membership of one project (managers only).
++type ManageProject interface {
++	ReadProject
++	// AddMember adds userID to the project with the given role. An unknown user,
++	// a user outside the project's organization or an invalid role is 400; a
++	// user who is already a member is 409.
++	AddMember(userID, role string) (MemberView, error)
++}
++
+ type readProject struct{ ps *projectScope }
+ 
+ func (p *readProject) ID() string { return p.ps.pid }
+@@ -228,6 +267,41 @@ func (p *readProject) Tasks() []TaskView {
+ 	return out
+ }
+ 
++type manageProject struct {
++	readProject
++}
++
++func (p *manageProject) AddMember(userID, role string) (MemberView, error) {
++	if userID == "" {
++		return MemberView{}, deny(ErrInvalid, "userId is required")
++	}
++	if role != RoleManager && role != RoleContributor && role != RoleViewer {
++		return MemberView{}, deny(ErrInvalid, "invalid role")
++	}
++	pid := p.ps.pid
++	err := p.ps.as.a.st.tx(func(s *state) error {
++		u, ok := s.users[userID]
++		if !ok {
++			return deny(ErrInvalid, "unknown user")
++		}
++		if u.org != s.projects[pid].org {
++			return deny(ErrInvalid, "user is not part of the project's organization")
++		}
++		if s.role(pid, userID) != "" {
++			return deny(ErrConflict, "already a member")
++		}
++		if s.members[pid] == nil {
++			s.members[pid] = map[string]string{}
++		}
++		s.members[pid][userID] = role
++		return nil
++	})
++	if err != nil {
++		return MemberView{}, err
++	}
++	return MemberView{UserID: userID, Role: role}, nil
++}
++
+ type writeProject struct {
+ 	readProject
+ 	role string
+diff --git a/main.go b/main.go
+index 29de540..2d060ad 100644
+--- a/main.go
++++ b/main.go
+@@ -71,6 +71,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(authz), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Post("/members", tanukirpc.NewHandler(addMember))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -134,6 +135,27 @@ func createTask(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*Task, err
+ 	return writeJSON(ctx.Response(), http.StatusCreated, t)
+ }
+ 
++type addMemberRequest struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++func addMember(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*capability.MemberView, error) {
++	p, err := ctx.Registry().scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	var req addMemberRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil {
++		return nil, errInvalidBody
++	}
++	m, err := p.AddMember(req.UserID, req.Role)
++	if err != nil {
++		return nil, err
++	}
++	return writeJSON(ctx.Response(), http.StatusCreated, m)
++}
++
+ func getTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Task, error) {
+ 	t, err := ctx.Registry().scope.Read()
+ 	if err != nil {
+@@ -232,7 +254,7 @@ func (errorHooker) OnError(w http.ResponseWriter, _ *http.Request, _ *slog.Logge
+ 		code, msg = http.StatusNotFound, err.Error()
+ 	case errors.Is(err, capability.ErrForbidden):
+ 		code, msg = http.StatusForbidden, err.Error()
+-	case errors.Is(err, capability.ErrArchived):
++	case errors.Is(err, capability.ErrArchived), errors.Is(err, capability.ErrConflict):
+ 		code, msg = http.StatusConflict, err.Error()
+ 	case errors.Is(err, capability.ErrInvalid):
+ 		code, msg = http.StatusBadRequest, err.Error()
+diff --git a/main_test.go b/main_test.go
+index 0277f51..43b4b40 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,68 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestAddMember(t *testing.T) {
++	cases := []struct {
++		name, user, project, body string
++		want                      int
++	}{
++		{"manager adds", "ann", "web", `{"userId":"hal","role":"contributor"}`, 201},
++		{"manager adds viewer", "ann", "web", `{"userId":"hal","role":"viewer"}`, 201},
++		{"manager adds manager", "ivy", "web", `{"userId":"hal","role":"manager"}`, 201},
++		{"contributor", "ben", "web", `{"userId":"hal","role":"contributor"}`, 403},
++		{"viewer", "dan", "web", `{"userId":"hal","role":"contributor"}`, 403},
++		{"org admin", "eve", "web", `{"userId":"hal","role":"contributor"}`, 403},
++		{"non member", "hal", "web", `{"userId":"ivy","role":"contributor"}`, 404},
++		{"anonymous", "", "web", `{"userId":"hal","role":"contributor"}`, 401},
++		{"unknown project", "ann", "nope", `{"userId":"hal","role":"contributor"}`, 404},
++		{"archived", "ann", "legacy", `{"userId":"hal","role":"contributor"}`, 409},
++		{"already member", "ann", "web", `{"userId":"ben","role":"viewer"}`, 409},
++		{"unknown user", "ann", "web", `{"userId":"zed","role":"contributor"}`, 400},
++		{"other org user", "ann", "web", `{"userId":"gus","role":"contributor"}`, 400},
++		{"invalid role", "ann", "web", `{"userId":"hal","role":"owner"}`, 400},
++		{"missing role", "ann", "web", `{"userId":"hal"}`, 400},
++		{"empty user id", "ann", "web", `{"userId":"","role":"contributor"}`, 400},
++		{"malformed body", "ann", "web", `{"userId":`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", "/projects/"+c.project+"/members", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestAddMemberResponseAndAccess(t *testing.T) {
++	h := newServer()
++
++	// hal cannot see web before being added.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "hal", ""); code != 404 {
++		t.Fatalf("before add: got %d want 404", code)
++	}
++
++	code, body := do(t, h, "POST", "/projects/web/members", "ann", `{"userId":"hal","role":"contributor"}`)
++	if code != 201 {
++		t.Fatalf("add: got %d want 201", code)
++	}
++	var got map[string]string
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	if got["userId"] != "hal" || got["role"] != "contributor" || len(got) != 2 {
++		t.Fatalf("unexpected body: %s", body)
++	}
++
++	// The new contributor can now read the project and create tasks.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "hal", ""); code != 200 {
++		t.Fatalf("after add read: got %d want 200", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "hal", `{"title":"x","assignee":"hal"}`); code != 201 {
++		t.Fatalf("after add create: got %d want 201", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

@@ -1,0 +1,262 @@
+diff --git a/README.md b/README.md
+index 8d54490..01edc76 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Only managers may change member roles (`PUT /projects/{pid}/members`, body `{"roles":{"userId":"role"}}`). It is all-or-nothing: unknown members, invalid roles, demoting someone who is still a task assignee to viewer, or removing the last manager → 400 and nothing changes.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..3715da8 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -120,6 +120,7 @@ type ProjectScope interface {
+ 	Actor() ActorScope
+ 	Read() (ReadProject, error)
+ 	Write() (WriteProject, error)
++	Manage() (ManageProject, error)
+ 	Task(taskID string) TaskScope
+ }
+ 
+@@ -200,8 +201,74 @@ func (s *projectScope) Write() (WriteProject, error) {
+ 	return &writeProject{readProject: readProject{ps: s}, role: role}, nil
+ }
+ 
++// Manage applies the manage rule: readable, manager (else 403), not archived
++// (else 409).
++func (s *projectScope) Manage() (ManageProject, error) {
++	err := s.as.a.st.read(func(st *state) error {
++		p, r, err := readable(st, s.as.actor, s.pid)
++		if err != nil {
++			return err
++		}
++		if r != RoleManager {
++			return deny(ErrForbidden, "forbidden")
++		}
++		if p.archived {
++			return deny(ErrArchived, "project is archived")
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &manageProject{readProject: readProject{ps: s}}, nil
++}
++
+ // ---- project capabilities ----------------------------------------------------
+ 
++// MemberView is the public representation of a project member.
++type MemberView struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++// ManageProject is the manager-only capability for project membership.
++type ManageProject interface {
++	ReadProject
++	// SetRoles changes the roles of existing members all-or-nothing and returns
++	// the resulting member list sorted by user ID. Unknown members, invalid
++	// roles, an empty request, or a change that would break an invariant (for
++	// example demoting a task assignee to viewer, or removing the last manager)
++	// are 400 and change nothing.
++	SetRoles(roles map[string]string) ([]MemberView, error)
++}
++
++type manageProject struct{ readProject }
++
++func (p *manageProject) SetRoles(roles map[string]string) ([]MemberView, error) {
++	if len(roles) == 0 {
++		return nil, deny(ErrInvalid, "roles must not be empty")
++	}
++	var out []MemberView
++	err := p.ps.as.a.st.tx(func(s *state) error {
++		m := s.members[p.ps.pid]
++		for uid, role := range roles {
++			if role != RoleManager && role != RoleContributor && role != RoleViewer {
++				return deny(ErrInvalid, "invalid role for "+uid)
++			}
++			if _, ok := m[uid]; !ok {
++				return deny(ErrInvalid, uid+" is not a member of the project")
++			}
++			m[uid] = role
++		}
++		out = s.membersOf(p.ps.pid)
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ // ReadProject may list and read the tasks of one project.
+ type ReadProject interface {
+ 	ID() string
+diff --git a/internal/capability/state.go b/internal/capability/state.go
+index 57a31af..2c10007 100644
+--- a/internal/capability/state.go
++++ b/internal/capability/state.go
+@@ -78,12 +78,22 @@ func (s *state) clone() *state {
+ //   - a task's Assignee is bound to the task's own project
+ //   - an assignee is always a contributor or manager of the task's project
+ //   - project members are users of the project's organization, with a valid role
++//   - a project with members has at least one manager
+ func (s *state) check() error {
+ 	for pid, m := range s.members {
+ 		p, ok := s.projects[pid]
+ 		if !ok {
+ 			return deny(ErrInvalid, fmt.Sprintf("members of unknown project %s", pid))
+ 		}
++		managers := 0
++		for _, role := range m {
++			if role == RoleManager {
++				managers++
++			}
++		}
++		if len(m) > 0 && managers == 0 {
++			return deny(ErrInvalid, fmt.Sprintf("project %s must keep at least one manager", pid))
++		}
+ 		for uid, role := range m {
+ 			u, ok := s.users[uid]
+ 			if !ok || u.org != p.org {
+@@ -122,6 +132,15 @@ func (s *state) tasksIn(projectID string) []TaskView {
+ 	return out
+ }
+ 
++func (s *state) membersOf(projectID string) []MemberView {
++	out := []MemberView{}
++	for uid, role := range s.members[projectID] {
++		out = append(out, MemberView{UserID: uid, Role: role})
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
++	return out
++}
++
+ func (s *state) newTaskID() string {
+ 	s.nextID++
+ 	return fmt.Sprintf("t%d", s.nextID)
+diff --git a/main.go b/main.go
+index 29de540..697307b 100644
+--- a/main.go
++++ b/main.go
+@@ -71,6 +71,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(authz), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Put("/members", tanukirpc.NewHandler(setMemberRoles))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -134,6 +135,22 @@ func createTask(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*Task, err
+ 	return writeJSON(ctx.Response(), http.StatusCreated, t)
+ }
+ 
++type setRolesRequest struct {
++	Roles map[string]string `json:"roles"`
++}
++
++func setMemberRoles(ctx tanukirpc.Context[*projectRegistry], _ struct{}) ([]capability.MemberView, error) {
++	p, err := ctx.Registry().scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	var req setRolesRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil {
++		return nil, errInvalidBody
++	}
++	return p.SetRoles(req.Roles)
++}
++
+ func getTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Task, error) {
+ 	t, err := ctx.Registry().scope.Read()
+ 	if err != nil {
+diff --git a/main_test.go b/main_test.go
+index 0277f51..105f3b3 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,80 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestSetMemberRoles(t *testing.T) {
++	cases := []struct {
++		name, user, project, body string
++		want                      int
++	}{
++		{"manager", "ann", "web", `{"roles":{"dan":"contributor","ivy":"contributor"}}`, 200},
++		{"contributor", "ben", "web", `{"roles":{"dan":"contributor"}}`, 403},
++		{"viewer", "dan", "web", `{"roles":{"dan":"manager"}}`, 403},
++		{"org admin", "eve", "web", `{"roles":{"dan":"contributor"}}`, 403},
++		{"non member", "hal", "web", `{"roles":{"dan":"contributor"}}`, 404},
++		{"other org", "gus", "web", `{"roles":{"dan":"contributor"}}`, 404},
++		{"archived", "ann", "legacy", `{"roles":{"ben":"viewer"}}`, 409},
++		{"invalid role", "ann", "web", `{"roles":{"dan":"boss"}}`, 400},
++		{"non member target", "ann", "web", `{"roles":{"hal":"viewer"}}`, 400},
++		{"empty", "ann", "web", `{"roles":{}}`, 400},
++		{"malformed", "ann", "web", `nope`, 400},
++		{"demote assignee", "ann", "web", `{"roles":{"ben":"viewer"}}`, 400},
++		{"demote last manager", "ivy", "ops", `{"roles":{"ivy":"viewer"}}`, 400},
++		{"no manager left", "ann", "web", `{"roles":{"ann":"viewer","ivy":"viewer"}}`, 400},
++		{"self demote with other manager", "ann", "web", `{"roles":{"ann":"viewer"}}`, 200},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "PUT", "/projects/"+c.project+"/members", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestSetMemberRolesResult(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"dan":"contributor","cat":"viewer2"}}`)
++	if code != 400 {
++		t.Fatalf("got %d want 400: %s", code, body)
++	}
++	// A rejected request changes nothing: dan is still a viewer.
++	code, _ = do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`)
++	if code != 403 {
++		t.Fatalf("rejected request changed dan: got %d", code)
++	}
++
++	code, body = do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"dan":"contributor","ivy":"viewer"}}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var members []struct{ UserID, Role string }
++	if err := json.Unmarshal([]byte(body), &members); err != nil {
++		t.Fatal(err)
++	}
++	got := map[string]string{}
++	for _, m := range members {
++		got[m.UserID] = m.Role
++	}
++	want := map[string]string{"ann": "manager", "ben": "contributor", "cat": "contributor", "dan": "contributor", "ivy": "viewer"}
++	if len(got) != len(want) {
++		t.Fatalf("got %v want %v", got, want)
++	}
++	for k, v := range want {
++		if got[k] != v {
++			t.Fatalf("got %v want %v", got, want)
++		}
++	}
++	if !strings.Contains(body, `"userId":"ann"`) {
++		t.Fatalf("unexpected JSON shape: %s", body)
++	}
++	// The change took effect: dan can now create tasks.
++	code, _ = do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`)
++	if code != 201 {
++		t.Fatalf("dan should be able to write now: got %d", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

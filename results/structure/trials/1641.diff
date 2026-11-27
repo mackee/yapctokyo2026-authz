@@ -1,0 +1,300 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..74ce15f 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| PUT | `/projects/{pid}/members` | `{"roles":{"<user>":"<role>",...}}` → 200 with the full member list `[{"userId","role"}]`, sorted by `userId` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,9 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Only managers may change member roles. Roles are `manager`, `contributor` or `viewer`.
++  A bulk role change is all-or-nothing: if any user is not a member of the project or any
++  role is invalid, the request fails with 400 and no role changes.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/main.go b/main.go
+index 647c0d2..26e79c1 100644
+--- a/main.go
++++ b/main.go
+@@ -23,6 +23,7 @@ import (
+ //   - contributors may only modify tasks assigned to themselves
+ //     and may not reassign tasks; managers may modify any task
+ //   - only managers may delete tasks
++//   - only managers may change member roles (all-or-nothing)
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
+ 
+@@ -49,6 +50,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("PUT /projects/{pid}/members", s.updateMemberRoles)
+ 	return mux
+ }
+ 
+@@ -100,8 +102,13 @@ func findProject(ctx context.Context, db *sql.DB, id string) (*project, error) {
+ 	return &p, nil
+ }
+ 
++// queryRower is satisfied by both *sql.DB and *sql.Tx.
++type queryRower interface {
++	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
++}
++
+ // findRole returns the user's role in the project ("" if not a member).
+-func findRole(ctx context.Context, db *sql.DB, projectID, userID string) (string, error) {
++func findRole(ctx context.Context, db queryRower, projectID, userID string) (string, error) {
+ 	var role string
+ 	err := db.QueryRowContext(ctx, `SELECT role FROM memberships WHERE project_id = ? AND user_id = ?`, projectID, userID).Scan(&role)
+ 	if errors.Is(err, sql.ErrNoRows) {
+@@ -457,3 +464,111 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	w.WriteHeader(204)
+ }
++
++type memberEntry struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++type updateMembersRequest struct {
++	Roles map[string]string `json:"roles"`
++}
++
++// updateMemberRoles changes the roles of several members at once. Either all
++// changes apply or none do; on success it returns the full member list.
++func (s *server) updateMemberRoles(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role, err := findRole(ctx, s.db, project.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req updateMembersRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Roles) == 0 {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	for _, newRole := range req.Roles {
++		if newRole != RoleManager && newRole != RoleContributor && newRole != RoleViewer {
++			writeError(w, 400, "invalid role")
++			return
++		}
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	for userID, newRole := range req.Roles {
++		current, err := findRole(ctx, tx, project.ID, userID)
++		if err != nil {
++			writeError(w, 500, "internal error")
++			return
++		}
++		if current == "" {
++			writeError(w, 400, "user "+userID+" is not a member of the project")
++			return
++		}
++		if _, err := tx.ExecContext(ctx, `UPDATE memberships SET role = ? WHERE project_id = ? AND user_id = ?`,
++			newRole, project.ID, userID); err != nil {
++			writeError(w, 500, "internal error")
++			return
++		}
++	}
++	rows, err := tx.QueryContext(ctx, `SELECT user_id, role FROM memberships WHERE project_id = ? ORDER BY user_id`, project.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer rows.Close()
++	members := []memberEntry{}
++	for rows.Next() {
++		var m memberEntry
++		if err := rows.Scan(&m.UserID, &m.Role); err != nil {
++			writeError(w, 500, "internal error")
++			return
++		}
++		members = append(members, m)
++	}
++	if err := rows.Err(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	rows.Close()
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, members)
++}
+diff --git a/members_test.go b/members_test.go
+new file mode 100644
+index 0000000..92b20b2
+--- /dev/null
++++ b/members_test.go
+@@ -0,0 +1,125 @@
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++	"reflect"
++	"testing"
++)
++
++type memberRole struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++// canCreate reports whether user can create a task in project (i.e. holds a
++// contributor or manager role there). Used to observe roles through the API.
++func canCreate(t *testing.T, h http.Handler, user, project string) bool {
++	t.Helper()
++	code, _ := do(t, h, "POST", "/projects/"+project+"/tasks", user, `{"title":"probe"}`)
++	return code == 200
++}
++
++func TestUpdateMemberRolesBulk(t *testing.T) {
++	s := newServer()
++	code, body := do(t, s, "PUT", "/projects/web/members", "ann", `{"roles":{"ben":"viewer","dan":"contributor"}}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200, body: %s", code, body)
++	}
++	var got []memberRole
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatalf("response is not a member list: %v: %s", err, body)
++	}
++	// Full member list after the change, sorted by userId.
++	want := []memberRole{
++		{"ann", "manager"},
++		{"ben", "viewer"},
++		{"cat", "contributor"},
++		{"dan", "contributor"},
++		{"ivy", "manager"},
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("members after update:\n got %v\nwant %v", got, want)
++	}
++
++	// The changes are persisted and take effect for later requests.
++	if canCreate(t, s, "ben", "web") {
++		t.Fatal("ben was made viewer but can still create tasks")
++	}
++	if !canCreate(t, s, "dan", "web") {
++		t.Fatal("dan was made contributor but cannot create tasks")
++	}
++}
++
++func TestUpdateMemberRolesScopedToProject(t *testing.T) {
++	s := newServer()
++	// ivy is a manager of both web and ops; cat is a contributor in both.
++	code, _ := do(t, s, "PUT", "/projects/web/members", "ivy", `{"roles":{"cat":"viewer"}}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200", code)
++	}
++	if canCreate(t, s, "cat", "web") {
++		t.Fatal("cat was made viewer in web but can still create tasks there")
++	}
++	if !canCreate(t, s, "cat", "ops") {
++		t.Fatal("cat's role in ops changed although only web was updated")
++	}
++}
++
++func TestUpdateMemberRolesAccess(t *testing.T) {
++	cases := []struct {
++		name, user, project string
++		want                int
++	}{
++		{"manager", "ann", "web", 200},
++		{"contributor", "ben", "web", 403},
++		{"viewer", "dan", "web", 403},
++		{"org admin without role", "eve", "web", 403},
++		{"manager of other project only", "ann", "ops", 403},
++		{"non member", "hal", "web", 404},
++		{"other org", "gus", "web", 404},
++		{"anonymous", "", "web", 401},
++		{"unknown user", "zed", "web", 401},
++		{"missing project", "ann", "nope", 404},
++		{"archived", "ann", "legacy", 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, body := do(t, newServer(), "PUT", "/projects/"+c.project+"/members", c.user, `{"roles":{"ben":"viewer"}}`)
++			if code != c.want {
++				t.Fatalf("got %d want %d, body: %s", code, c.want, body)
++			}
++		})
++	}
++}
++
++// A request that cannot be fully applied must change nothing.
++func TestUpdateMemberRolesRejectedWithoutChanges(t *testing.T) {
++	cases := []struct {
++		name, body string
++	}{
++		{"non member target", `{"roles":{"ben":"viewer","hal":"viewer"}}`},
++		{"invalid role", `{"roles":{"ben":"viewer","cat":"owner"}}`},
++		{"empty role", `{"roles":{"ben":"viewer","cat":""}}`},
++		{"empty roles", `{"roles":{}}`},
++		{"missing roles", `{}`},
++		{"invalid json", `not json`},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			s := newServer()
++			code, body := do(t, s, "PUT", "/projects/web/members", "ann", c.body)
++			if code != 400 {
++				t.Fatalf("got %d want 400, body: %s", code, body)
++			}
++			// ben (a contributor) must still be able to create tasks, and
++			// cat (also a contributor) must not have been touched either.
++			if !canCreate(t, s, "ben", "web") {
++				t.Fatal("ben's role changed although the request was rejected")
++			}
++			if !canCreate(t, s, "cat", "web") {
++				t.Fatal("cat's role changed although the request was rejected")
++			}
++		})
++	}
++}

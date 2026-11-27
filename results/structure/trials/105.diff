@@ -1,0 +1,339 @@
+diff --git a/README.md b/README.md
+index 8d54490..a7637c3 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members/import` | `{"fromProjectId"}` → 200 with the project's members `[{"userId","role"}]` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Importing members (`POST /projects/{pid}/members/import`) requires the `manager` role in the target project. Contributors and viewers get 403, org admins (who cannot write) get 403, and non-members get 404. The source project (`fromProjectId`) must be readable by the caller, otherwise 404. Archived targets → 409.
++- An import copies the source's members and roles into the target. Users who are already members of the target keep their current role. The response is the target's member list after the import.
+ 
+ ## Seed data
+ 
+@@ -60,7 +63,7 @@ Transformer "/projects/{pid}"   authenticates X-User -> projectRegistry{scope Pr
+ 
+ - Handlers only see **scopes** bound to the authenticated actor and the path.
+   To read or write anything they **acquire a capability** from a scope:
+-  `ProjectScope.Read()/Write()`, `TaskScope.Read()/Edit()/Manage()`. Each
++  `ProjectScope.Read()/Write()/Manage()`, `TaskScope.Read()/Edit()/Manage()`. Each
+   acquisition applies the access rules and returns an error that maps onto the
+   HTTP status convention (`ErrUnauthenticated` 401, `ErrNotFound` 404,
+   `ErrForbidden` 403, `ErrArchived` 409, `ErrInvalid` 400).
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..32f25bc 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -5,7 +5,7 @@
+ // from them:
+ //
+ //	ActorScope   -> Project(pid) ProjectScope
+-//	ProjectScope -> Read() ReadProject | Write() WriteProject | Task(tid) TaskScope
++//	ProjectScope -> Read() ReadProject | Write() WriteProject | Manage() ManageProject | Task(tid) TaskScope
+ //	TaskScope    -> Read() ReadTask    | Edit() EditTask      | Manage() ManageTask
+ //
+ // Each Acquire applies the access rules (see README) and returns an error that
+@@ -58,6 +58,12 @@ type TaskView struct {
+ 	Assignee  string `json:"assignee"`
+ }
+ 
++// MemberView is one project member and their project role.
++type MemberView struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
+ // Assignee is an assignee that has been admitted for one specific project:
+ // either nobody, or a user who is a contributor or manager of that project.
+ // It can only be obtained from WriteProject.AdmitAssignee (or ManageTask), and
+@@ -120,6 +126,7 @@ type ProjectScope interface {
+ 	Actor() ActorScope
+ 	Read() (ReadProject, error)
+ 	Write() (WriteProject, error)
++	Manage() (ManageProject, error)
+ 	Task(taskID string) TaskScope
+ }
+ 
+@@ -200,6 +207,28 @@ func (s *projectScope) Write() (WriteProject, error) {
+ 	return &writeProject{readProject: readProject{ps: s}, role: role}, nil
+ }
+ 
++// Manage applies the membership rule: readable, manager (else 403), not
++// archived (else 409). Org admins are not managers and get 403.
++func (s *projectScope) Manage() (ManageProject, error) {
++	err := s.as.a.st.read(func(st *state) error {
++		p, r, err := readable(st, s.as.actor, s.pid)
++		if err != nil {
++			return err
++		}
++		if r != RoleManager {
++			return deny(ErrForbidden, "forbidden")
++		}
++		if p.archived {
++			return deny(ErrArchived, "project is archived")
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &manageProject{readProject: readProject{ps: s}}, nil
++}
++
+ // ---- project capabilities ----------------------------------------------------
+ 
+ // ReadProject may list and read the tasks of one project.
+@@ -219,6 +248,15 @@ type WriteProject interface {
+ 	CreateTask(title string, assignee Assignee) (TaskView, error)
+ }
+ 
++// ManageProject may change the membership of one project.
++type ManageProject interface {
++	ReadProject
++	// ImportMembers copies the members and roles of from into this project.
++	// Users who are already members keep their current role. It returns the
++	// project's members afterwards. from must be readable by the actor.
++	ImportMembers(from ReadProject) ([]MemberView, error)
++}
++
+ type readProject struct{ ps *projectScope }
+ 
+ func (p *readProject) ID() string { return p.ps.pid }
+@@ -228,6 +266,30 @@ func (p *readProject) Tasks() []TaskView {
+ 	return out
+ }
+ 
++type manageProject struct{ readProject }
++
++func (p *manageProject) ImportMembers(from ReadProject) ([]MemberView, error) {
++	src, ok := from.(*readProject)
++	if !ok {
++		return nil, deny(ErrInvalid, "unknown source project")
++	}
++	var out []MemberView
++	err := p.ps.as.a.st.tx(func(s *state) error {
++		dst := p.ps.pid
++		if s.members[dst] == nil {
++			s.members[dst] = map[string]string{}
++		}
++		for uid, role := range s.members[src.ps.pid] {
++			if _, exists := s.members[dst][uid]; !exists {
++				s.members[dst][uid] = role
++			}
++		}
++		out = s.membersIn(dst)
++		return nil
++	})
++	return out, err
++}
++
+ type writeProject struct {
+ 	readProject
+ 	role string
+diff --git a/internal/capability/state.go b/internal/capability/state.go
+index 57a31af..07daf96 100644
+--- a/internal/capability/state.go
++++ b/internal/capability/state.go
+@@ -122,6 +122,15 @@ func (s *state) tasksIn(projectID string) []TaskView {
+ 	return out
+ }
+ 
++func (s *state) membersIn(projectID string) []MemberView {
++	out := []MemberView{}
++	for uid, role := range s.members[projectID] {
++		out = append(out, MemberView{UserID: uid, Role: role})
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
++	return out
++}
++
+ func (s *state) newTaskID() string {
+ 	s.nextID++
+ 	return fmt.Sprintf("t%d", s.nextID)
+diff --git a/main.go b/main.go
+index 29de540..c3c714c 100644
+--- a/main.go
++++ b/main.go
+@@ -71,6 +71,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(authz), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Post("/members/import", tanukirpc.NewHandler(importMembers))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -134,6 +135,26 @@ func createTask(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*Task, err
+ 	return writeJSON(ctx.Response(), http.StatusCreated, t)
+ }
+ 
++type importMembersRequest struct {
++	FromProjectID string `json:"fromProjectId"`
++}
++
++func importMembers(ctx tanukirpc.Context[*projectRegistry], _ struct{}) ([]capability.MemberView, error) {
++	p, err := ctx.Registry().scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	var req importMembersRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil || req.FromProjectID == "" {
++		return nil, errInvalidBody
++	}
++	from, err := ctx.Registry().scope.Actor().Project(req.FromProjectID).Read()
++	if err != nil {
++		return nil, err
++	}
++	return p.ImportMembers(from)
++}
++
+ func getTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Task, error) {
+ 	t, err := ctx.Registry().scope.Read()
+ 	if err != nil {
+diff --git a/members_test.go b/members_test.go
+new file mode 100644
+index 0000000..00dd2e4
+--- /dev/null
++++ b/members_test.go
+@@ -0,0 +1,134 @@
++package main
++
++import (
++	"encoding/json"
++	"reflect"
++	"strings"
++	"testing"
++
++	"taskboard/internal/capability"
++)
++
++func TestImportMembers(t *testing.T) {
++	cases := []struct {
++		name, user, project, body string
++		want                      int
++	}{
++		{"manager imports", "ivy", "ops", `{"fromProjectId":"web"}`, 200},
++		{"manager imports into own project from itself", "ivy", "web", `{"fromProjectId":"web"}`, 200},
++		{"contributor", "ben", "legacy", `{"fromProjectId":"web"}`, 403},
++		{"viewer", "dan", "web", `{"fromProjectId":"ops"}`, 403},
++		{"manager of source only", "ann", "ops", `{"fromProjectId":"web"}`, 403},
++		{"org admin", "eve", "ops", `{"fromProjectId":"web"}`, 403},
++		{"non member of target", "hal", "web", `{"fromProjectId":"ops"}`, 404},
++		{"anonymous", "", "web", `{"fromProjectId":"ops"}`, 401},
++		{"unknown target", "ivy", "nope", `{"fromProjectId":"web"}`, 404},
++		{"archived target", "ann", "legacy", `{"fromProjectId":"web"}`, 409},
++		{"source not readable (not a member)", "ivy", "ops", `{"fromProjectId":"legacy"}`, 404},
++		{"source in other org", "ivy", "web", `{"fromProjectId":"gx"}`, 404},
++		{"source missing", "ivy", "web", `{"fromProjectId":"nope"}`, 404},
++		{"missing fromProjectId", "ivy", "web", `{}`, 400},
++		{"malformed body", "ivy", "web", `not json`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", "/projects/"+c.project+"/members/import", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestImportMembersResult(t *testing.T) {
++	// web: ann manager, ben contributor, cat contributor, dan viewer, ivy manager
++	// ops (before): ann viewer, cat contributor, ivy manager
++	// ann keeps her viewer role in ops; the others are added with their web roles.
++	code, body := do(t, newServer(), "POST", "/projects/ops/members/import", "ivy", `{"fromProjectId":"web"}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200: %s", code, body)
++	}
++	var got []capability.MemberView
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := []capability.MemberView{
++		{UserID: "ann", Role: "viewer"},
++		{UserID: "ben", Role: "contributor"},
++		{UserID: "cat", Role: "contributor"},
++		{UserID: "dan", Role: "viewer"},
++		{UserID: "ivy", Role: "manager"},
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("got %+v want %+v", got, want)
++	}
++	if want := `{"userId":"ann","role":"viewer"}`; !strings.Contains(body, want) {
++		t.Fatalf("response %s does not use the userId/role JSON shape (want %s)", body, want)
++	}
++}
++
++func TestImportMembersKeepsExistingRole(t *testing.T) {
++	// ann is a viewer in ops but a manager in web; importing ops into web must
++	// not demote her.
++	code, body := do(t, newServer(), "POST", "/projects/web/members/import", "ivy", `{"fromProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200: %s", code, body)
++	}
++	var got []capability.MemberView
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := []capability.MemberView{
++		{UserID: "ann", Role: "manager"},
++		{UserID: "ben", Role: "contributor"},
++		{UserID: "cat", Role: "contributor"},
++		{UserID: "dan", Role: "viewer"},
++		{UserID: "ivy", Role: "manager"},
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Fatalf("got %+v want %+v", got, want)
++	}
++}
++
++func TestImportMembersPersistsAndIsIdempotent(t *testing.T) {
++	srv := newServer()
++
++	// ben is not a member of ops yet, so cannot read it.
++	if code, _ := do(t, srv, "GET", "/projects/ops/tasks", "ben", ""); code != 404 {
++		t.Fatalf("before import: got %d want 404", code)
++	}
++
++	code, first := do(t, srv, "POST", "/projects/ops/members/import", "ivy", `{"fromProjectId":"web"}`)
++	if code != 200 {
++		t.Fatalf("first import: got %d want 200: %s", code, first)
++	}
++
++	// The import is committed: ben can now read ops.
++	if code, _ := do(t, srv, "GET", "/projects/ops/tasks", "ben", ""); code != 200 {
++		t.Fatalf("after import: got %d want 200", code)
++	}
++
++	// Importing the same source again changes nothing.
++	code, second := do(t, srv, "POST", "/projects/ops/members/import", "ivy", `{"fromProjectId":"web"}`)
++	if code != 200 {
++		t.Fatalf("second import: got %d want 200: %s", code, second)
++	}
++	if first != second {
++		t.Fatalf("second import changed the members:\nfirst  %s\nsecond %s", first, second)
++	}
++}
++
++func TestImportMembersSourceUnchanged(t *testing.T) {
++	srv := newServer()
++	if code, body := do(t, srv, "POST", "/projects/ops/members/import", "ivy", `{"fromProjectId":"web"}`); code != 200 {
++		t.Fatalf("import: got %d want 200: %s", code, body)
++	}
++	// web keeps its own members: dan is still a viewer there and can still read it.
++	if code, _ := do(t, srv, "GET", "/projects/web/tasks", "dan", ""); code != 200 {
++		t.Fatalf("web read after import: got %d want 200", code)
++	}
++	// ops' manager status for ivy is unaffected and ops members are readable.
++	if code, _ := do(t, srv, "POST", "/projects/ops/tasks", "ivy", `{"title":"x"}`); code != 201 {
++		t.Fatalf("ivy write to ops after import: got %d want 201", code)
++	}
++}

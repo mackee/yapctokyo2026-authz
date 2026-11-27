@@ -1,0 +1,270 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..990ffae 100644
+--- a/README.md
++++ b/README.md
+@@ -21,9 +21,13 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members/{uid}/move` | `{"toProjectId"}` → 200 `{"userId","projectId","role"}` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
++The move endpoint removes `{uid}` from the path project and adds them to `toProjectId`
++with the same role (team transfers).
++
+ ## Access rules
+ 
+ - Unknown or missing user → 401.
+@@ -32,6 +36,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Moving a member requires the `manager` role in both the source and the destination project (org admins without a role get 403). The member must belong to the source project → 404 otherwise. The destination must differ from the source → 400, must be in the caller's organization → 404, and must not already contain the member → 409. Archived source or destination → 409.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/main.go b/main.go
+index 647c0d2..64451c1 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/members/{uid}/move", s.moveMember)
+ 	return mux
+ }
+ 
+@@ -405,6 +406,139 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, 200, task)
+ }
+ 
++type moveMemberRequest struct {
++	ToProjectID string `json:"toProjectId"`
++}
++
++type moveMemberResponse struct {
++	UserID    string `json:"userId"`
++	ProjectID string `json:"projectId"`
++	Role      string `json:"role"`
++}
++
++// moveMember removes a member from the path project and adds them to
++// toProjectId with the same role. Only managers of both projects may do this.
++func (s *server) moveMember(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	src, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if src == nil || src.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role, err := findRole(ctx, s.db, src.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if src.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	targetID := r.PathValue("uid")
++	memberRole, err := findRole(ctx, s.db, src.ID, targetID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if memberRole == "" {
++		writeError(w, 404, "not found")
++		return
++	}
++	var req moveMemberRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	if req.ToProjectID == src.ID {
++		writeError(w, 400, "destination must be a different project")
++		return
++	}
++	dst, err := findProject(ctx, s.db, req.ToProjectID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if dst == nil || dst.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	dstRole, err := findRole(ctx, s.db, dst.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if dstRole == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if dstRole != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if dst.Archived {
++		writeError(w, 409, "destination project is archived")
++		return
++	}
++	existing, err := findRole(ctx, s.db, dst.ID, targetID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if existing != "" {
++		writeError(w, 409, "user is already a member of the destination project")
++		return
++	}
++	target, err := findUser(ctx, s.db, targetID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if target == nil || target.OrgID != dst.OrgID {
++		writeError(w, 400, "user must belong to the destination organization")
++		return
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, src.ID, targetID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `INSERT INTO memberships (project_id, user_id, role) VALUES (?, ?, ?)`, dst.ID, targetID, memberRole); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, moveMemberResponse{UserID: targetID, ProjectID: dst.ID, Role: memberRole})
++}
++
+ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	ctx := r.Context()
+ 	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
+diff --git a/main_test.go b/main_test.go
+index 5c16a74..3e36b2e 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,87 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestMoveMember(t *testing.T) {
++	const move = `{"toProjectId":"ops"}`
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager of both", "ivy", "/projects/web/members/ben/move", move, 200},
++		{"viewer keeps role", "ivy", "/projects/web/members/dan/move", move, 200},
++		{"manager of source only", "ann", "/projects/web/members/ben/move", move, 403},
++		{"contributor caller", "ben", "/projects/web/members/cat/move", move, 403},
++		{"viewer caller", "dan", "/projects/web/members/ben/move", move, 403},
++		{"org admin caller", "eve", "/projects/web/members/ben/move", move, 403},
++		{"non member caller", "hal", "/projects/web/members/ben/move", move, 404},
++		{"other org caller", "gus", "/projects/web/members/ben/move", move, 404},
++		{"anonymous", "", "/projects/web/members/ben/move", move, 401},
++		{"unknown user", "zed", "/projects/web/members/ben/move", move, 401},
++		{"source missing", "ivy", "/projects/nope/members/ben/move", move, 404},
++		{"target not in source", "ivy", "/projects/web/members/hal/move", move, 404},
++		{"already in destination", "ivy", "/projects/web/members/cat/move", move, 409},
++		{"archived source", "ann", "/projects/legacy/members/ben/move", `{"toProjectId":"web"}`, 409},
++		{"archived destination", "ann", "/projects/web/members/dan/move", `{"toProjectId":"legacy"}`, 409},
++		{"same project", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"web"}`, 400},
++		{"missing destination", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"nope"}`, 404},
++		{"destination other org", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"gx"}`, 404},
++		{"missing toProjectId", "ivy", "/projects/web/members/ben/move", `{}`, 400},
++		{"bad body", "ivy", "/projects/web/members/ben/move", `not json`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveMemberResponseAndEffects(t *testing.T) {
++	s := newServer()
++
++	code, body := do(t, s, "POST", "/projects/web/members/dan/move", "ivy", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("move viewer: got %d: %s", code, body)
++	}
++	var got map[string]string
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := map[string]string{"userId": "dan", "projectId": "ops", "role": "viewer"}
++	if len(got) != len(want) {
++		t.Fatalf("response %s: want exactly keys userId, projectId, role", body)
++	}
++	for k, v := range want {
++		if got[k] != v {
++			t.Fatalf("response %s: %s = %q, want %q", body, k, got[k], v)
++		}
++	}
++
++	// dan is no longer a member of web, and is now a viewer of ops.
++	if code, _ := do(t, s, "GET", "/projects/web/tasks", "dan", ""); code != 404 {
++		t.Fatalf("dan reads web after move: got %d want 404", code)
++	}
++	if code, _ := do(t, s, "GET", "/projects/ops/tasks", "dan", ""); code != 200 {
++		t.Fatalf("dan reads ops after move: got %d want 200", code)
++	}
++	if code, _ := do(t, s, "POST", "/projects/ops/tasks", "dan", `{"title":"x"}`); code != 403 {
++		t.Fatalf("dan (viewer) writes ops after move: got %d want 403", code)
++	}
++
++	// ben keeps the contributor role in ops.
++	if code, _ := do(t, s, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`); code != 200 {
++		t.Fatalf("move contributor: got %d", code)
++	}
++	if code, _ := do(t, s, "POST", "/projects/ops/tasks", "ben", `{"title":"x","assignee":"ben"}`); code != 200 {
++		t.Fatalf("ben (contributor) creates in ops after move: got %d want 200", code)
++	}
++	if code, _ := do(t, s, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("ben reads web after move: got %d want 404", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

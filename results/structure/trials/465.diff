@@ -1,0 +1,223 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..452e2ad 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/freeze` | sets every member's role to `viewer` → 200 `[{"userId","role"}]` (members after the change, sorted by `userId`) |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -33,6 +34,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
++- Freezing a project is manager-only (other roles get 403; org admins without a project role get 403). It sets every member's role to `viewer`, including managers, so nobody can change the project's tasks afterwards. Freezing is one-way in the API: there is no unfreeze endpoint.
+ - A task ID that does not belong to the project in the path → 404.
+ 
+ ## Seed data
+diff --git a/main.go b/main.go
+index 647c0d2..4000a5a 100644
+--- a/main.go
++++ b/main.go
+@@ -25,6 +25,8 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - freezing a project is manager-only; it sets every member's role to viewer,
++//     so the write rules above then reject all task writes with 403
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -49,6 +51,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/freeze", s.freezeProject)
+ 	return mux
+ }
+ 
+@@ -457,3 +460,84 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	w.WriteHeader(204)
+ }
++
++type member struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++// freezeProject demotes every member of the project to viewer, which makes all
++// task writes fail with 403. Only managers may freeze. Returns the members after the change.
++func (s *server) freezeProject(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role, err := findRole(ctx, s.db, project.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "only managers may freeze projects")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	if _, err := tx.ExecContext(ctx, `UPDATE memberships SET role = ? WHERE project_id = ?`, RoleViewer, project.ID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	rows, err := tx.QueryContext(ctx, `SELECT user_id, role FROM memberships WHERE project_id = ? ORDER BY user_id`, project.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	members := []member{}
++	for rows.Next() {
++		var m member
++		if err := rows.Scan(&m.UserID, &m.Role); err != nil {
++			rows.Close()
++			writeError(w, 500, "internal error")
++			return
++		}
++		members = append(members, m)
++	}
++	rows.Close()
++	if err := rows.Err(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, members)
++}
+diff --git a/main_test.go b/main_test.go
+index 5c16a74..dcb67cd 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,92 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestFreezeAccess(t *testing.T) {
++	cases := []struct {
++		name, user, project string
++		want                int
++	}{
++		{"manager", "ann", "web", 200},
++		{"other manager", "ivy", "web", 200},
++		{"contributor", "ben", "web", 403},
++		{"viewer", "dan", "web", 403},
++		{"org admin", "eve", "web", 403},
++		{"non member", "hal", "web", 404},
++		{"other org", "gus", "web", 404},
++		{"archived", "ann", "legacy", 409},
++		{"missing project", "ann", "nope", 404},
++		{"anonymous", "", "web", 401},
++		{"unknown user", "zed", "web", 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", "/projects/"+c.project+"/freeze", c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestFreezeResponse(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/projects/web/freeze", "ann", "")
++	if code != 200 {
++		t.Fatalf("got %d want 200", code)
++	}
++	var got []member
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatalf("bad body %q: %v", body, err)
++	}
++	want := []member{
++		{"ann", "viewer"}, {"ben", "viewer"}, {"cat", "viewer"}, {"dan", "viewer"}, {"ivy", "viewer"},
++	}
++	if len(got) != len(want) {
++		t.Fatalf("got %v want %v", got, want)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("member %d: got %v want %v", i, got[i], want[i])
++		}
++	}
++	// Freezing web must not touch ops: cat is still a contributor there.
++	if code, body := do(t, h, "POST", "/projects/ops/tasks", "cat", `{"title":"x"}`); code != 200 {
++		t.Fatalf("ops write after web freeze: got %d want 200: %s", code, body)
++	}
++}
++
++func TestFreezeBlocksTaskWrites(t *testing.T) {
++	h := newServer()
++	if code, body := do(t, h, "POST", "/projects/web/freeze", "ann", ""); code != 200 {
++		t.Fatalf("freeze: got %d want 200: %s", code, body)
++	}
++	cases := []struct {
++		name, user, method, path, body string
++		want                           int
++	}{
++		{"manager create", "ann", "POST", "/projects/web/tasks", `{"title":"x"}`, 403},
++		{"former contributor create", "ben", "POST", "/projects/web/tasks", `{"title":"x"}`, 403},
++		{"former contributor own update", "ben", "PATCH", "/projects/web/tasks/t1", `{"status":"done"}`, 403},
++		{"former manager update", "ann", "PATCH", "/projects/web/tasks/t2", `{"status":"done"}`, 403},
++		{"former manager reassign", "ivy", "PATCH", "/projects/web/tasks/t2", `{"assignee":"ben"}`, 403},
++		{"former manager delete", "ann", "DELETE", "/projects/web/tasks/t1", "", 403},
++		{"former manager cannot refreeze", "ann", "POST", "/projects/web/freeze", "", 403},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, body := do(t, h, c.method, c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d: %s", code, c.want, body)
++			}
++		})
++	}
++	// Reads still work, and the task is unchanged.
++	code, body := do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
++	if code != 200 || !strings.Contains(body, `"status":"open"`) {
++		t.Fatalf("read after freeze: %d %s", code, body)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

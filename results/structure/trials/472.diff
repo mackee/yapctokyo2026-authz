@@ -1,0 +1,247 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..626a8a9 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| PUT | `/projects/{pid}/members` | `{"roles":{"<userId>":"<role>",...}}` → 200 with the full member list `[{"userId","role"}]` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -34,6 +35,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Only managers may change member roles. Roles are `manager`, `contributor` or `viewer`.
++- Role changes are all-or-nothing: if any target is not a member of the project or any role is invalid, the request fails with 400 and nothing changes. An empty `roles` map is 400.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 647c0d2..b15581a 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("PUT /projects/{pid}/members", s.updateMemberRoles)
+ 	return mux
+ }
+ 
+@@ -457,3 +458,121 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	w.WriteHeader(204)
+ }
++
++type membersRequest struct {
++	Roles map[string]string `json:"roles"`
++}
++
++type member struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++// updateMemberRoles changes the roles of several existing members at once.
++// The whole batch is applied in one transaction: if any target is not a member
++// of the project or any role is invalid, nothing is changed.
++func (s *server) updateMemberRoles(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role, err := findRole(ctx, s.db, project.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "only managers may change member roles")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req membersRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Roles) == 0 {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	for _, newRole := range req.Roles {
++		if newRole != RoleManager && newRole != RoleContributor && newRole != RoleViewer {
++			writeError(w, 400, "invalid role")
++			return
++		}
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	current, err := listMembers(ctx, tx, project.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	members := make(map[string]bool, len(current))
++	for _, m := range current {
++		members[m.UserID] = true
++	}
++	for userID := range req.Roles {
++		if !members[userID] {
++			writeError(w, 400, "not a member of the project: "+userID)
++			return
++		}
++	}
++	for userID, newRole := range req.Roles {
++		if _, err := tx.ExecContext(ctx, `UPDATE memberships SET role = ? WHERE project_id = ? AND user_id = ?`,
++			newRole, project.ID, userID); err != nil {
++			writeError(w, 500, "internal error")
++			return
++		}
++	}
++	result, err := listMembers(ctx, tx, project.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, result)
++}
++
++// listMembers returns the members of a project ordered by user ID.
++func listMembers(ctx context.Context, tx *sql.Tx, projectID string) ([]member, error) {
++	rows, err := tx.QueryContext(ctx, `SELECT user_id, role FROM memberships WHERE project_id = ? ORDER BY user_id`, projectID)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	members := []member{}
++	for rows.Next() {
++		var m member
++		if err := rows.Scan(&m.UserID, &m.Role); err != nil {
++			return nil, err
++		}
++		members = append(members, m)
++	}
++	return members, rows.Err()
++}
+diff --git a/main_test.go b/main_test.go
+index 5c16a74..4c522e9 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,87 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestUpdateMemberRoles(t *testing.T) {
++	cases := []struct {
++		name, user, project, body string
++		want                      int
++	}{
++		{"manager", "ann", "web", `{"roles":{"ben":"viewer","dan":"contributor"}}`, 200},
++		{"contributor", "ben", "web", `{"roles":{"cat":"viewer"}}`, 403},
++		{"viewer", "dan", "web", `{"roles":{"cat":"viewer"}}`, 403},
++		{"org admin without role", "eve", "web", `{"roles":{"cat":"viewer"}}`, 403},
++		{"non member", "hal", "web", `{"roles":{"cat":"viewer"}}`, 404},
++		{"other org", "gus", "web", `{"roles":{"cat":"viewer"}}`, 404},
++		{"anonymous", "", "web", `{"roles":{"cat":"viewer"}}`, 401},
++		{"unknown user", "zed", "web", `{"roles":{"cat":"viewer"}}`, 401},
++		{"archived", "ann", "legacy", `{"roles":{"ben":"viewer"}}`, 409},
++		{"empty roles", "ann", "web", `{"roles":{}}`, 400},
++		{"missing roles", "ann", "web", `{}`, 400},
++		{"bad json", "ann", "web", `{"roles":`, 400},
++		{"invalid role", "ann", "web", `{"roles":{"ben":"owner"}}`, 400},
++		{"non member target", "ann", "web", `{"roles":{"hal":"viewer"}}`, 400},
++		{"partial non member target", "ann", "web", `{"roles":{"ben":"viewer","hal":"viewer"}}`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "PUT", "/projects/"+c.project+"/members", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestUpdateMemberRolesResponse(t *testing.T) {
++	srv := newServer()
++	code, body := do(t, srv, "PUT", "/projects/web/members", "ann", `{"roles":{"ben":"viewer","dan":"contributor"}}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var got []member
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := []member{
++		{"ann", "manager"}, {"ben", "viewer"}, {"cat", "contributor"},
++		{"dan", "contributor"}, {"ivy", "manager"},
++	}
++	if len(got) != len(want) {
++		t.Fatalf("got %v want %v", got, want)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("row %d: got %v want %v", i, got[i], want[i])
++		}
++	}
++	// dan is now a contributor, so may create tasks.
++	if code, _ := do(t, srv, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`); code != 200 {
++		t.Fatalf("dan create after promotion: got %d", code)
++	}
++}
++
++func TestUpdateMemberRolesIsAtomic(t *testing.T) {
++	srv := newServer()
++	if code, _ := do(t, srv, "PUT", "/projects/web/members", "ann", `{"roles":{"ben":"viewer","hal":"viewer"}}`); code != 400 {
++		t.Fatalf("got %d want 400", code)
++	}
++	if code, _ := do(t, srv, "PUT", "/projects/web/members", "ann", `{"roles":{"cat":"viewer","ben":"nope"}}`); code != 400 {
++		t.Fatalf("got %d want 400", code)
++	}
++	// Neither failed request may have changed ben or cat.
++	code, body := do(t, srv, "PUT", "/projects/web/members", "ann", `{"roles":{"ivy":"manager"}}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var got []member
++	json.Unmarshal([]byte(body), &got)
++	for _, m := range got {
++		if (m.UserID == "ben" || m.UserID == "cat") && m.Role != "contributor" {
++			t.Fatalf("%s changed to %s by a failed request", m.UserID, m.Role)
++		}
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

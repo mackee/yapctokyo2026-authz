@@ -1,0 +1,326 @@
+diff --git a/README.md b/README.md
+index 185e8ff..6631669 100644
+--- a/README.md
++++ b/README.md
+@@ -16,6 +16,7 @@ go test ./...
+ | --- | --- | --- |
+ | GET | `/projects/{pid}/tasks` | list tasks of a project |
+ | POST | `/projects/{pid}/tasks` | `{"title","assignee"}` → 201 |
++| POST | `/projects/{pid}/freeze` | sets every member to `viewer` → 200 with `[{"userId","role"}]` |
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+@@ -30,7 +31,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
+-- Archived projects reject all writes with 409 (reads still work).
++- Freezing: only managers of the project may freeze it (others 403, non-members 404). Freezing sets every member's role to `viewer`, managers included, and returns the members after the change, sorted by user ID. Freezing is not undone by the API. Viewers cannot write, so a frozen project's tasks cannot be created, edited or deleted by anyone. Reads still work. Freezing again is 403, since no manager is left.
++- Archived projects reject all writes, including freezing, with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+ ## Seed data
+@@ -60,7 +62,7 @@ Transformer "/projects/{pid}"   authenticates X-User -> projectRegistry{scope Pr
+ 
+ - Handlers only see **scopes** bound to the authenticated actor and the path.
+   To read or write anything they **acquire a capability** from a scope:
+-  `ProjectScope.Read()/Write()`, `TaskScope.Read()/Edit()/Manage()`. Each
++  `ProjectScope.Read()/Write()/Manage()`, `TaskScope.Read()/Edit()/Manage()`. Each
+   acquisition applies the access rules and returns an error that maps onto the
+   HTTP status convention (`ErrUnauthenticated` 401, `ErrNotFound` 404,
+   `ErrForbidden` 403, `ErrArchived` 409, `ErrInvalid` 400).
+diff --git a/internal/capability/aggregate.go b/internal/capability/aggregate.go
+index af9c3c6..e64979d 100644
+--- a/internal/capability/aggregate.go
++++ b/internal/capability/aggregate.go
+@@ -92,6 +92,33 @@ func (a *updateTaskAggregate) save(x *tx) TaskView {
+ 	return a.task.view()
+ }
+ 
++// freezeProjectAggregate moves every member of one project to the viewer role.
++type freezeProjectAggregate struct {
++	members []membershipRecord // already set to RoleViewer, sorted by user ID
++}
++
++func loadFreezeProject(x *tx, projectID string) (*freezeProjectAggregate, error) {
++	if _, ok := x.findProject(projectID); !ok {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	a := &freezeProjectAggregate{members: x.membershipsOf(projectID)}
++	for i := range a.members {
++		a.members[i].Role = RoleViewer
++	}
++	return a, nil
++}
++
++func (a *freezeProjectAggregate) validate() error { return nil }
++
++func (a *freezeProjectAggregate) save(x *tx) []MemberView {
++	out := make([]MemberView, 0, len(a.members))
++	for _, m := range a.members {
++		m.save(x)
++		out = append(out, m.view())
++	}
++	return out
++}
++
+ // deleteTaskAggregate removes one task.
+ type deleteTaskAggregate struct {
+ 	task taskRecord
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index 6c9e50b..343f305 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -5,7 +5,7 @@
+ // from them:
+ //
+ //	ActorScope   -> Project(pid) ProjectScope
+-//	ProjectScope -> Read() ReadProject | Write() WriteProject | Task(tid) TaskScope
++//	ProjectScope -> Read() ReadProject | Write() WriteProject | Manage() ManageProject | Task(tid) TaskScope
+ //	TaskScope    -> Read() ReadTask    | Edit() EditTask      | Manage() ManageTask
+ //
+ // Each Acquire applies the access rules (see README) and returns an error that
+@@ -57,6 +57,12 @@ type TaskView struct {
+ 	Assignee  string `json:"assignee"`
+ }
+ 
++// MemberView is the public representation of one project member.
++type MemberView struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
+ // Assignee is an assignee that has been admitted for one specific project:
+ // either nobody, or a user who is a contributor or manager of that project.
+ // It can only be obtained from WriteProject.AdmitAssignee.
+@@ -111,12 +117,13 @@ type ActorScope interface {
+ }
+ 
+ // ProjectScope is bound to one actor and one project ID. It grants nothing by
+-// itself; call Read/Write/Task to acquire a capability.
++// itself; call Read/Write/Manage/Task to acquire a capability.
+ type ProjectScope interface {
+ 	ID() string
+ 	Actor() ActorScope
+ 	Read() (ReadProject, error)
+ 	Write() (WriteProject, error)
++	Manage() (ManageProject, error)
+ 	Task(taskID string) TaskScope
+ }
+ 
+@@ -197,6 +204,28 @@ func (s *projectScope) Write() (WriteProject, error) {
+ 	return &writeProject{readProject: readProject{ps: s}, role: role}, nil
+ }
+ 
++// Manage applies the manager rule: readable, manager (else 403; org admins who
++// are not members are 403 too), not archived (else 409).
++func (s *projectScope) Manage() (ManageProject, error) {
++	err := s.as.a.db.view(func(x *tx) error {
++		p, r, err := readable(x, s.as.actor, s.pid)
++		if err != nil {
++			return err
++		}
++		if r != RoleManager {
++			return deny(ErrForbidden, "forbidden")
++		}
++		if p.Archived {
++			return deny(ErrArchived, "project is archived")
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &manageProject{readProject: readProject{ps: s}}, nil
++}
++
+ // ---- project capabilities ----------------------------------------------------
+ 
+ // ReadProject may list and read the tasks of one project.
+@@ -216,6 +245,15 @@ type WriteProject interface {
+ 	CreateTask(title string, assignee Assignee) (TaskView, error)
+ }
+ 
++// ManageProject is the manager-only capability for one project.
++type ManageProject interface {
++	ReadProject
++	// Freeze moves every member of the project to the viewer role (managers
++	// included) and returns the members after the change, sorted by user ID.
++	// Writers can no longer change the project's tasks.
++	Freeze() ([]MemberView, error)
++}
++
+ type readProject struct{ ps *projectScope }
+ 
+ func (p *readProject) ID() string { return p.ps.pid }
+@@ -235,6 +273,26 @@ type writeProject struct {
+ 	role string
+ }
+ 
++type manageProject struct {
++	readProject
++}
++
++func (p *manageProject) Freeze() ([]MemberView, error) {
++	var out []MemberView
++	err := p.ps.as.a.db.update(func(x *tx) error {
++		agg, err := loadFreezeProject(x, p.ps.pid)
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		out = agg.save(x)
++		return nil
++	})
++	return out, err
++}
++
+ func (p *writeProject) Role() string { return p.role }
+ 
+ func (p *writeProject) AdmitAssignee(userID string) (Assignee, error) {
+diff --git a/internal/capability/record.go b/internal/capability/record.go
+index 6fb5efb..3c62b37 100644
+--- a/internal/capability/record.go
++++ b/internal/capability/record.go
+@@ -185,6 +185,10 @@ func (r taskRecord) view() TaskView {
+ 	return TaskView{ID: r.ID, ProjectID: r.ProjectID, Title: r.Title, Status: r.Status, Assignee: r.AssigneeID}
+ }
+ 
++func (r membershipRecord) view() MemberView {
++	return MemberView{UserID: r.UserID, Role: r.Role}
++}
++
+ func isWriterRole(role string) bool { return role == RoleManager || role == RoleContributor }
+ 
+ func newSeededDB() *db {
+diff --git a/main.go b/main.go
+index 8299822..1487480 100644
+--- a/main.go
++++ b/main.go
+@@ -34,6 +34,9 @@ import (
+ // Task is the JSON shape of a task.
+ type Task = capability.TaskView
+ 
++// Member is the JSON shape of a project member.
++type Member = capability.MemberView
++
+ type rootRegistry struct{}
+ 
+ // projectRegistry is the whole handler-visible surface under /projects/{pid}.
+@@ -71,6 +74,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(authz), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Post("/freeze", tanukirpc.NewHandler(freezeProject))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -134,6 +138,14 @@ func createTask(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*Task, err
+ 	return writeJSON(ctx.Response(), http.StatusCreated, t)
+ }
+ 
++func freezeProject(ctx tanukirpc.Context[*projectRegistry], _ struct{}) ([]Member, error) {
++	p, err := ctx.Registry().scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	return p.Freeze()
++}
++
+ func getTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Task, error) {
+ 	t, err := ctx.Registry().scope.Read()
+ 	if err != nil {
+diff --git a/main_test.go b/main_test.go
+index 0277f51..817a8cb 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,87 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestFreezeAccess(t *testing.T) {
++	cases := []struct {
++		name, user, project string
++		want                int
++	}{
++		{"manager", "ann", "web", 200},
++		{"contributor", "ben", "web", 403},
++		{"viewer", "dan", "web", 403},
++		{"org admin", "eve", "web", 403},
++		{"non member", "hal", "web", 404},
++		{"other org", "gus", "web", 404},
++		{"anonymous", "", "web", 401},
++		{"unknown project", "ann", "nope", 404},
++		{"archived", "ann", "legacy", 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", "/projects/"+c.project+"/freeze", c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestFreezeResponse(t *testing.T) {
++	code, body := do(t, newServer(), "POST", "/projects/web/freeze", "ann", "")
++	if code != 200 {
++		t.Fatalf("got %d want 200: %s", code, body)
++	}
++	var got []struct {
++		UserID string `json:"userId"`
++		Role   string `json:"role"`
++	}
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := []string{"ann", "ben", "cat", "dan", "ivy"}
++	if len(got) != len(want) {
++		t.Fatalf("got %d members, want %d: %s", len(got), len(want), body)
++	}
++	for i, u := range want {
++		if got[i].UserID != u || got[i].Role != "viewer" {
++			t.Fatalf("member %d: got %+v, want {%s viewer}: %s", i, got[i], u, body)
++		}
++	}
++}
++
++func TestFreezeBlocksTaskChanges(t *testing.T) {
++	srv := newServer()
++	if code, body := do(t, srv, "POST", "/projects/web/freeze", "ann", ""); code != 200 {
++		t.Fatalf("freeze: got %d: %s", code, body)
++	}
++
++	cases := []struct {
++		name, method, user, path, body string
++		want                           int
++	}{
++		{"contributor create", "POST", "ben", "/projects/web/tasks", `{"title":"x","assignee":"ben"}`, 403},
++		{"manager create", "POST", "ann", "/projects/web/tasks", `{"title":"x"}`, 403},
++		{"contributor own edit", "PATCH", "ben", "/projects/web/tasks/t1", `{"status":"done"}`, 403},
++		{"manager edit", "PATCH", "ann", "/projects/web/tasks/t2", `{"status":"done"}`, 403},
++		{"manager delete", "DELETE", "ann", "/projects/web/tasks/t1", "", 403},
++		{"freeze again", "POST", "ann", "/projects/web/freeze", "", 403},
++		{"read still works", "GET", "ann", "/projects/web/tasks/t1", "", 200},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, body := do(t, srv, c.method, c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d: %s", code, c.want, body)
++			}
++		})
++	}
++
++	// Other projects are unaffected: ivy is still a manager of ops.
++	if code, body := do(t, srv, "POST", "/projects/ops/tasks", "ivy", `{"title":"x"}`); code != 201 {
++		t.Fatalf("ops create after web freeze: got %d: %s", code, body)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

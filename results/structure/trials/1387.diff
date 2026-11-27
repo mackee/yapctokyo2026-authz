@@ -1,0 +1,507 @@
+diff --git a/README.md b/README.md
+index 5300749..25d4054 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| DELETE | `/orgs/{oid}/users/{uid}` | remove the user from every project of the org (offboarding) → 204 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`. Request
+ bodies are JSON (`Content-Type: application/json`).
+@@ -37,6 +38,15 @@ bodies are JSON (`Content-Type: application/json`).
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Removing a user from an organization (`DELETE /orgs/{oid}/users/{uid}`):
++  - Unknown or missing user → 401. An organization other than the caller's, or
++    an unknown one → 404. A caller who is not an org admin → 403.
++  - A user who is missing or belongs to another organization → 404.
++  - Otherwise → 204. The user's memberships in the organization's projects are
++    removed, and the tasks of those projects assigned to them are unassigned
++    (so every assignee is still a contributor or manager of its project).
++  - Archived projects do not block this: an offboarded user must be removable
++    from them too. Removing a user who has no memberships is a no-op → 204.
+ 
+ ## Seed data
+ 
+@@ -93,9 +103,10 @@ Transformer "/projects/{pid}"   authenticates X-User, builds ProjectAuthz -> pro
+   Record style. They load their related rows through relation methods that
+   call the tables (for example `project.Membership(ctx, db, userID)`,
+   `membership.AssignedTasks(ctx, db)`, `user.Memberships(ctx, db)`,
+-  `task.Project(ctx, db)`), and a change to a row is an unexported method on
+-  the row object that saves it (for example `task.assign`, `task.unassign`,
+-  `task.rename`), so rows are changed only by table operations.
++  `task.Project(ctx, db)`, `user.MembershipsInOrg(ctx, db)`), and a change to a
++  row is an unexported method on the row object that saves it (for example
++  `task.assign`, `task.unassign`, `task.rename`, `membership.destroy`), so rows
++  are changed only by table operations.
+ - Each table operation runs its own aggregate (`aggregate.go`) inside the
+   transaction: it starts from the row the operation is about (found through its
+   table), loads the
+diff --git a/internal/model/aggregate.go b/internal/model/aggregate.go
+index e558654..80af115 100644
+--- a/internal/model/aggregate.go
++++ b/internal/model/aggregate.go
+@@ -144,3 +144,50 @@ func loadDeleteTask(ctx context.Context, tx DB, taskID string) (*deleteTaskAggre
+ func (a *deleteTaskAggregate) validate() error { return nil }
+ 
+ func (a *deleteTaskAggregate) apply(ctx context.Context, tx DB) error { return a.task.destroy(ctx, tx) }
++
++// removeOrgUserAggregate removes one user from every project of an organization.
++type removeOrgUserAggregate struct {
++	user        *User
++	memberships []*Membership // the user's memberships in the organization's projects
++	tasks       []*Task       // the tasks of those projects assigned to the user
++}
++
++func loadRemoveOrgUser(ctx context.Context, tx DB, orgID, userID string) (*removeOrgUserAggregate, error) {
++	u, err := NewUserTable().Find(ctx, tx, userID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	if u.Org != orgID {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	ms, err := u.MembershipsInOrg(ctx, tx)
++	if err != nil {
++		return nil, err
++	}
++	ts, err := u.AssignedTasksInOrg(ctx, tx)
++	if err != nil {
++		return nil, err
++	}
++	return &removeOrgUserAggregate{user: u, memberships: ms, tasks: ts}, nil
++}
++
++// validate has nothing to check: the change unassigns every task the user
++// holds in the organization, so no assignee is left without its membership.
++func (a *removeOrgUserAggregate) validate() error { return nil }
++
++// apply unassigns the tasks first, then removes the memberships.
++func (a *removeOrgUserAggregate) apply(ctx context.Context, tx DB) error {
++	for _, t := range a.tasks {
++		if err := t.unassign(ctx, tx); err != nil {
++			return err
++		}
++	}
++	for _, m := range a.memberships {
++		if err := m.destroy(ctx, tx); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/internal/model/authz.go b/internal/model/authz.go
+index 89224a1..dd1b630 100644
+--- a/internal/model/authz.go
++++ b/internal/model/authz.go
+@@ -121,6 +121,24 @@ func (a TaskAuthz) CanManage() error {
+ 	return nil
+ }
+ 
++// OrgAuthz is what the actor may do in one organization.
++type OrgAuthz struct {
++	actor Actor
++	org   string
++}
++
++// OrgID returns the organization the object is bound to.
++func (a OrgAuthz) OrgID() string { return a.org }
++
++// CanManageUsers returns nil if the actor may remove users from the
++// organization: org admins only (else ErrForbidden).
++func (a OrgAuthz) CanManageUsers() error {
++	if a.org == "" || !a.actor.orgAdmin {
++		return deny(ErrForbidden, "forbidden")
++	}
++	return nil
++}
++
+ // ---- building authorization objects -------------------------------------------------
+ 
+ // Authenticate resolves the X-User value. Unknown or missing users are 401.
+@@ -163,6 +181,16 @@ func NewProjectAuthz(ctx context.Context, db DB, act Actor, projectID string) (P
+ 	return ProjectAuthz{actor: act, project: p.ID, role: role, archived: p.Archived}, nil
+ }
+ 
++// NewOrgAuthz builds the actor's authorization object for one organization.
++// Only the actor's own organization is visible to them; any other one, or an
++// unknown one, is ErrNotFound.
++func NewOrgAuthz(act Actor, orgID string) (OrgAuthz, error) {
++	if orgID == "" || act.org != orgID {
++		return OrgAuthz{}, deny(ErrNotFound, "not found")
++	}
++	return OrgAuthz{actor: act, org: orgID}, nil
++}
++
+ // NewTaskAuthz builds the actor's authorization object for one task of the
+ // project. The task must belong to the project; otherwise ErrNotFound.
+ func NewTaskAuthz(ctx context.Context, db DB, pa ProjectAuthz, taskID string) (TaskAuthz, error) {
+diff --git a/internal/model/membership_table.go b/internal/model/membership_table.go
+index 3e01344..b3a3fb9 100644
+--- a/internal/model/membership_table.go
++++ b/internal/model/membership_table.go
+@@ -32,6 +32,15 @@ func (mt *MembershipTable) ListByUser(ctx context.Context, db DB, userID string)
+ 		`SELECT project_id, user_id, role FROM memberships WHERE user_id = ? ORDER BY project_id`, userID)
+ }
+ 
++// ListByUserInOrg returns the memberships of the user in the projects of the
++// organization, ordered by project ID.
++func (mt *MembershipTable) ListByUserInOrg(ctx context.Context, db DB, userID, orgID string) ([]*Membership, error) {
++	return mt.list(ctx, db,
++		`SELECT m.project_id, m.user_id, m.role FROM memberships m
++		 JOIN projects p ON p.id = m.project_id
++		 WHERE m.user_id = ? AND p.org_id = ? ORDER BY m.project_id`, userID, orgID)
++}
++
+ func (*MembershipTable) list(ctx context.Context, db DB, query string, args ...any) ([]*Membership, error) {
+ 	rows, err := db.QueryContext(ctx, query, args...)
+ 	if err != nil {
+diff --git a/internal/model/record.go b/internal/model/record.go
+index b23b291..c4cf5ff 100644
+--- a/internal/model/record.go
++++ b/internal/model/record.go
+@@ -59,6 +59,18 @@ func (r *User) AssignedTasks(ctx context.Context, db DB) ([]*Task, error) {
+ 	return NewTaskTable().ListByAssignee(ctx, db, r.ID)
+ }
+ 
++// MembershipsInOrg returns the user's memberships in the projects of the
++// user's organization.
++func (r *User) MembershipsInOrg(ctx context.Context, db DB) ([]*Membership, error) {
++	return NewMembershipTable().ListByUserInOrg(ctx, db, r.ID, r.Org)
++}
++
++// AssignedTasksInOrg returns the tasks assigned to the user in the projects of
++// the user's organization.
++func (r *User) AssignedTasksInOrg(ctx context.Context, db DB) ([]*Task, error) {
++	return NewTaskTable().ListByAssigneeInOrg(ctx, db, r.ID, r.Org)
++}
++
+ // Memberships returns the project's members.
+ func (r *Project) Memberships(ctx context.Context, db DB) ([]*Membership, error) {
+ 	return NewMembershipTable().ListByProject(ctx, db, r.ID)
+@@ -185,6 +197,15 @@ func (r *Project) save(ctx context.Context, db DB) error {
+ 	return nil
+ }
+ 
++// destroy removes the membership.
++func (r *Membership) destroy(ctx context.Context, db DB) error {
++	if _, err := db.ExecContext(ctx,
++		`DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, r.ProjectID, r.UserID); err != nil {
++		return err
++	}
++	return nil
++}
++
+ func (r *Membership) save(ctx context.Context, db DB) error {
+ 	if _, err := db.ExecContext(ctx,
+ 		`INSERT INTO memberships (project_id, user_id, role) VALUES (?, ?, ?)
+diff --git a/internal/model/task_table.go b/internal/model/task_table.go
+index 5ac0b03..dbbb11d 100644
+--- a/internal/model/task_table.go
++++ b/internal/model/task_table.go
+@@ -40,6 +40,15 @@ func (tt *TaskTable) ListByAssignee(ctx context.Context, db DB, userID string) (
+ 		`SELECT id, project_id, title, status, assignee FROM tasks WHERE assignee = ? ORDER BY id`, userID)
+ }
+ 
++// ListByAssigneeInOrg returns the tasks assigned to the user in the projects of
++// the organization, ordered by ID.
++func (tt *TaskTable) ListByAssigneeInOrg(ctx context.Context, db DB, userID, orgID string) ([]*Task, error) {
++	return tt.list(ctx, db,
++		`SELECT t.id, t.project_id, t.title, t.status, t.assignee FROM tasks t
++		 JOIN projects p ON p.id = t.project_id
++		 WHERE t.assignee = ? AND p.org_id = ? ORDER BY t.id`, userID, orgID)
++}
++
+ // ListByProjectAndAssignee returns the tasks of the project assigned to the
+ // user, ordered by ID.
+ func (tt *TaskTable) ListByProjectAndAssignee(ctx context.Context, db DB, projectID, userID string) ([]*Task, error) {
+diff --git a/internal/model/user_table.go b/internal/model/user_table.go
+index 4905832..e6ffca5 100644
+--- a/internal/model/user_table.go
++++ b/internal/model/user_table.go
+@@ -2,7 +2,7 @@ package model
+ 
+ import "context"
+ 
+-// UserTable reads the users table.
++// UserTable is the users table.
+ type UserTable struct{}
+ 
+ // NewUserTable returns the users table.
+@@ -17,3 +17,24 @@ func (*UserTable) Find(ctx context.Context, db DB, id string) (*User, error) {
+ 	}
+ 	return &u, nil
+ }
++
++// RemoveFromOrg removes the user from every project of the organization
++// (offboarding, DELETE /orgs/{oid}/users/{uid}). The authorization object
++// decides who may do it (org admins of the organization); the aggregate
++// removes the memberships and unassigns the user's tasks in those projects.
++// Archived projects do not block it.
++func (*UserTable) RemoveFromOrg(ctx context.Context, db DB, authz OrgAuthz, userID string) error {
++	if err := authz.CanManageUsers(); err != nil {
++		return err
++	}
++	return inTx(ctx, db, func(tx DB) error {
++		agg, err := loadRemoveOrgUser(ctx, tx, authz.OrgID(), userID)
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		return agg.apply(ctx, tx)
++	})
++}
+diff --git a/main.go b/main.go
+index 5bcd29e..446cb0e 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,12 @@ type taskRegistry struct {
+ 	authz model.TaskAuthz
+ }
+ 
++// orgRegistry is the whole handler-visible surface under /orgs/{orgID}.
++type orgRegistry struct {
++	db    model.DB
++	authz model.OrgAuthz
++}
++
+ func init() {
+ 	// tanukirpc logs every request through the default slog logger; keep the
+ 	// demo and test output quiet.
+@@ -84,9 +90,29 @@ func newServer() http.Handler {
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
+ 		})
+ 	})
++
++	tanukirpc.RouteWithTransformer(r, orgTransformer(conn), "/orgs/{orgID}", func(or *tanukirpc.Router[*orgRegistry]) {
++		or.Delete("/users/{uid}", tanukirpc.NewHandler(removeOrgUser))
++	})
+ 	return r
+ }
+ 
++// orgTransformer authenticates the caller and builds the actor's authorization
++// object for {orgID}. Another organization stops here (404).
++func orgTransformer(conn *sql.DB) tanukirpc.Transformer[*rootRegistry, *orgRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*rootRegistry]) (*orgRegistry, error) {
++		actor, err := model.Authenticate(ctx, conn, ctx.Request().Header.Get("X-User"))
++		if err != nil {
++			return nil, err
++		}
++		authz, err := model.NewOrgAuthz(actor, chi.URLParam(ctx.Request(), "orgID"))
++		if err != nil {
++			return nil, err
++		}
++		return &orgRegistry{db: conn, authz: authz}, nil
++	})
++}
++
+ // projectTransformer authenticates the caller and builds the actor's
+ // authorization object for {pid}. Unreadable projects stop here (404).
+ func projectTransformer(conn *sql.DB) tanukirpc.Transformer[*rootRegistry, *projectRegistry] {
+@@ -163,6 +189,16 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++// removeOrgUser removes {uid} from every project of the organization (offboarding).
++func removeOrgUser(ctx tanukirpc.Context[*orgRegistry], _ struct{}) (*struct{}, error) {
++	reg := ctx.Registry()
++	if err := model.NewUserTable().RemoveFromOrg(ctx, reg.db, reg.authz, chi.URLParam(ctx.Request(), "uid")); err != nil {
++		return nil, err
++	}
++	ctx.Response().WriteHeader(http.StatusNoContent)
++	return nil, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // jsonResponseCodec encodes responses as JSON even when the request has no
+diff --git a/main_test.go b/main_test.go
+index a54b0a8..aae6971 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -135,3 +135,80 @@ func TestDelete(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestRemoveOrgUser(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"org admin", "eve", "/orgs/acme/users/ben", 204},
++		{"org admin, user already gone", "eve", "/orgs/acme/users/hal", 204},
++		{"manager, not org admin", "ann", "/orgs/acme/users/ben", 403},
++		{"contributor, not org admin", "ben", "/orgs/acme/users/cat", 403},
++		{"non admin, unknown target", "ann", "/orgs/acme/users/zed", 403},
++		{"other org admin", "gus", "/orgs/acme/users/ben", 404},
++		{"unknown org", "eve", "/orgs/nowhere/users/ben", 404},
++		{"target in other org", "eve", "/orgs/acme/users/gus", 404},
++		{"unknown target", "eve", "/orgs/acme/users/zed", 404},
++		{"anonymous", "", "/orgs/acme/users/ben", 401},
++		{"unknown actor", "zed", "/orgs/acme/users/ben", 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveOrgUserOffboards(t *testing.T) {
++	h := newServer()
++	if code, body := do(t, h, "DELETE", "/orgs/acme/users/ben", "eve", ""); code != 204 {
++		t.Fatalf("got %d want 204: %s", code, body)
++	}
++
++	// ben is out of every acme project, archived ones included.
++	for _, path := range []string{"/projects/web/tasks", "/projects/legacy/tasks"} {
++		if code, _ := do(t, h, "GET", path, "ben", ""); code != 404 {
++			t.Fatalf("GET %s as ben: got %d want 404", path, code)
++		}
++	}
++	// ben can no longer be assigned work.
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "ann", `{"title":"x","assignee":"ben"}`); code != 400 {
++		t.Fatalf("assign removed user: got %d want 400", code)
++	}
++
++	// Tasks assigned to ben are unassigned; other assignments stay.
++	assignees := map[string]string{}
++	for _, path := range []string{"/projects/web/tasks", "/projects/legacy/tasks"} {
++		code, body := do(t, h, "GET", path, "ann", "")
++		if code != 200 {
++			t.Fatalf("GET %s as ann: got %d", path, code)
++		}
++		var tasks []Task
++		if err := json.Unmarshal([]byte(body), &tasks); err != nil {
++			t.Fatal(err)
++		}
++		for _, task := range tasks {
++			assignees[task.ID] = task.AssigneeID
++		}
++	}
++	want := map[string]string{"t1": "", "t2": "cat", "t3": "", "t5": ""}
++	for id, assignee := range want {
++		if assignees[id] != assignee {
++			t.Fatalf("task %s assignee %q, want %q", id, assignees[id], assignee)
++		}
++	}
++
++	// Removing again is a no-op with the same answer.
++	if code, _ := do(t, h, "DELETE", "/orgs/acme/users/ben", "eve", ""); code != 204 {
++		t.Fatalf("second removal: got %d want 204", code)
++	}
++
++	// Other organizations are untouched.
++	if code, _ := do(t, h, "GET", "/projects/gx/tasks", "gus", ""); code != 200 {
++		t.Fatalf("globex after acme offboarding: got %d want 200", code)
++	}
++}
+diff --git a/spec/taskboard.qnt b/spec/taskboard.qnt
+index fe78764..5de5091 100644
+--- a/spec/taskboard.qnt
++++ b/spec/taskboard.qnt
+@@ -16,6 +16,7 @@
+ // unassigned task, or no membership).
+ module taskboard {
+   type UserId = str
++  type OrgId = str
+   type ProjectId = str
+   type TaskId = int
+   type Role = str // "manager" | "contributor" | "viewer"; "" = not a member
+@@ -25,6 +26,7 @@ module taskboard {
+   type Task = { project: ProjectId, status: str, assignee: UserId }
+ 
+   pure val USERS = Set("ann", "ben", "cat", "dan", "eve", "hal", "ivy", "gus", "nobody")
++  pure val ORGS = Set("acme", "globex", "nowhere")
+   pure val PROJECTS = Set("web", "ops", "legacy", "gx", "missing")
+   pure val ROLES = Set("manager", "contributor", "viewer")
+   pure val STATUSES = Set("open", "doing", "done")
+@@ -164,6 +166,35 @@ module taskboard {
+       members' = members,
+     } else unchanged
+ 
++  // DELETE /orgs/{oid}/users/{uid}
++  // Only org admins of the organization may remove a user from it. Removal is
++  // not blocked by archived projects (it is an offboarding step, and an archived
++  // project has no other way to drop a member).
++  def removeOrgUserOutcome(u: UserId, o: OrgId, uid: UserId): int =
++    if (not(userExists(u))) 401
++    else if (users.get(u).org != o) 404
++    else if (not(users.get(u).orgAdmin)) 403
++    else if (not(userExists(uid))) 404
++    else if (users.get(uid).org != o) 404
++    else 204
++
++  // Removes uid from every project of org o, and unassigns the tasks of those
++  // projects that are assigned to uid, so that an assignee is still a writer of
++  // its project (inv_assigneeIsWriter).
++  action removeOrgUser(u: UserId, o: OrgId, uid: UserId): bool =
++    if (removeOrgUserOutcome(u, o, uid) == 204) all {
++      members' = members.keys()
++        .filter(k => not(k._2 == uid and projects.get(k._1).org == o))
++        .mapBy(k => members.get(k)),
++      tasks' = tasks.keys().mapBy(t => {
++        val x = tasks.get(t)
++        if (x.assignee == uid and projects.get(x.project).org == o) { ...x, assignee: "" } else x
++      }),
++      nextTask' = nextTask,
++      users' = users,
++      projects' = projects,
++    } else unchanged
++
+   // ---- seed data and steps -------------------------------------------------
+ 
+   action init = all {
+@@ -202,10 +233,13 @@ module taskboard {
+     nondet t = 1.to(nextTask).oneOf()
+     nondet s = STATUSES.oneOf()
+     nondet changeAssignee = Set(true, false).oneOf()
++    nondet o = ORGS.oneOf()
++    nondet uid = USERS.oneOf()
+     any {
+       createTask(u, p, a),
+       updateTask(u, p, t, s, changeAssignee, a),
+       deleteTask(u, p, t),
++      removeOrgUser(u, o, uid),
+     }
+   }
+ 
+@@ -230,6 +264,27 @@ module taskboard {
+       assert(deleteOutcome("ann", "web", 1) == 204),
+       assert(deleteOutcome("ben", "web", 1) == 403),
+       assert(deleteOutcome("ann", "web", 4) == 404),
++      assert(removeOrgUserOutcome("nobody", "acme", "ben") == 401),
++      assert(removeOrgUserOutcome("ann", "acme", "ben") == 403),
++      assert(removeOrgUserOutcome("gus", "acme", "ben") == 404),
++      assert(removeOrgUserOutcome("eve", "globex", "gus") == 404),
++      assert(removeOrgUserOutcome("eve", "nowhere", "ben") == 404),
++      assert(removeOrgUserOutcome("eve", "acme", "zed") == 404),
++      assert(removeOrgUserOutcome("eve", "acme", "gus") == 404),
++      assert(removeOrgUserOutcome("eve", "acme", "ben") == 204),
++      unchanged,
++    })
++
++  // Offboarding: ben leaves acme. Memberships in acme projects go (also in the
++  // archived one), tasks assigned to ben in acme go unassigned, the rest stays.
++  run offboardTest =
++    init.then(removeOrgUser("eve", "acme", "ben")).then(all {
++      assert(not(members.keys().exists(k => k._2 == "ben"))),
++      assert(members.get(("web", "cat")) == "contributor"),
++      assert(tasks.get(1).assignee == ""),
++      assert(tasks.get(5).assignee == ""),
++      assert(tasks.get(2).assignee == "cat"),
++      assert(tasks.get(6).assignee == "gus"),
+       unchanged,
+     })
+ }

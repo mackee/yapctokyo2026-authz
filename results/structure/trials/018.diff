@@ -1,0 +1,212 @@
+diff --git a/README.md b/README.md
+index ba637dd..b1cf9d6 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members/import` | `{"fromProjectId"}` → 200 with the project's members `[{"userId","role"}]` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Member import copies every member of `fromProjectId` into the path project with their role. Users already in the path project keep their current role. Only managers of the path project may import (others 403; archived → 409). The source project must be in the same organization and readable by the caller, otherwise 404. Importing from the path project itself → 400.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 6152a73..6804164 100644
+--- a/main.go
++++ b/main.go
+@@ -22,6 +22,9 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - member import needs the manager role in the target project;
++//     the source project must be readable by the user (else 404)
++//   - importing from the same project                          -> 400
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -42,6 +45,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/members/import", s.importMembers)
+ 	return mux
+ }
+ 
+@@ -282,3 +286,58 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	s.store.DeleteTask(task.ID)
+ 	w.WriteHeader(204)
+ }
++
++type importMembersRequest struct {
++	FromProjectID string `json:"fromProjectId"`
++}
++
++func (s *server) importMembers(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	user := s.store.User(r.Header.Get("X-User"))
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project := s.store.Project(r.PathValue("pid"))
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role := s.store.Role(project.ID, user.ID)
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req importMembersRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.FromProjectID == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	if req.FromProjectID == project.ID {
++		writeError(w, 400, "cannot import members from the same project")
++		return
++	}
++	// The caller must be able to read the source, otherwise importing would
++	// reveal its membership.
++	source := s.store.Project(req.FromProjectID)
++	if source == nil || source.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if s.store.Role(source.ID, user.ID) == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	s.store.ImportMembers(project.ID, source.ID)
++	writeJSON(w, 200, s.store.Members(project.ID))
++}
+diff --git a/main_test.go b/main_test.go
+index 0277f51..0b4a36d 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,66 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestImportMembers(t *testing.T) {
++	// ops: ann viewer, cat contributor, ivy manager
++	// web: ann manager, ben contributor, cat contributor, dan viewer, ivy manager
++	code, body := do(t, newServer(), "POST", "/projects/ops/members/import", "ivy", `{"fromProjectId":"web"}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var members []Member
++	if err := json.Unmarshal([]byte(body), &members); err != nil {
++		t.Fatal(err)
++	}
++	want := []Member{
++		{UserID: "ann", Role: RoleViewer},      // existing role kept
++		{UserID: "ben", Role: RoleContributor}, // imported
++		{UserID: "cat", Role: RoleContributor}, // existing
++		{UserID: "dan", Role: RoleViewer},      // imported
++		{UserID: "ivy", Role: RoleManager},     // existing
++	}
++	if len(members) != len(want) {
++		t.Fatalf("got %v want %v", members, want)
++	}
++	for i := range want {
++		if members[i] != want[i] {
++			t.Fatalf("got %v want %v", members, want)
++		}
++	}
++}
++
++func TestImportMembersAccess(t *testing.T) {
++	cases := []struct {
++		name, user, project, body string
++		want                      int
++	}{
++		{"anonymous", "", "ops", `{"fromProjectId":"web"}`, 401},
++		{"unknown user", "zed", "ops", `{"fromProjectId":"web"}`, 401},
++		{"non member target", "hal", "ops", `{"fromProjectId":"web"}`, 404},
++		{"other org target", "gus", "ops", `{"fromProjectId":"web"}`, 404},
++		{"missing target", "ann", "nope", `{"fromProjectId":"web"}`, 404},
++		{"viewer target", "ann", "ops", `{"fromProjectId":"web"}`, 403},
++		{"contributor target", "cat", "ops", `{"fromProjectId":"web"}`, 403},
++		{"org admin target", "eve", "ops", `{"fromProjectId":"web"}`, 403},
++		{"archived target", "ann", "legacy", `{"fromProjectId":"web"}`, 409},
++		{"same project", "ann", "web", `{"fromProjectId":"web"}`, 400},
++		{"missing source field", "ivy", "ops", `{}`, 400},
++		{"bad body", "ivy", "ops", `not json`, 400},
++		{"missing source", "ivy", "ops", `{"fromProjectId":"nope"}`, 404},
++		{"source other org", "ivy", "ops", `{"fromProjectId":"gx"}`, 404},
++		{"source not readable", "ivy", "web", `{"fromProjectId":"legacy"}`, 404},
++		{"archived source ok", "ann", "web", `{"fromProjectId":"legacy"}`, 200},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", "/projects/"+c.project+"/members/import", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string
+diff --git a/store.go b/store.go
+index f468b2d..3584a97 100644
+--- a/store.go
++++ b/store.go
+@@ -69,6 +69,35 @@ func (s *Store) NewTaskID() string {
+ 	return fmt.Sprintf("t%d", s.nextID)
+ }
+ 
++// Member is a user's role in a project.
++type Member struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++// Members lists the members of a project, sorted by user ID.
++func (s *Store) Members(projectID string) []Member {
++	out := []Member{}
++	for uid, role := range s.members[projectID] {
++		out = append(out, Member{UserID: uid, Role: role})
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
++	return out
++}
++
++// ImportMembers copies every member of fromID into toID with the same role.
++// Users who are already members of toID keep their existing role.
++func (s *Store) ImportMembers(toID, fromID string) {
++	if s.members[toID] == nil {
++		s.members[toID] = map[string]string{}
++	}
++	for uid, role := range s.members[fromID] {
++		if _, ok := s.members[toID][uid]; !ok {
++			s.members[toID][uid] = role
++		}
++	}
++}
++
+ func (s *Store) PutTask(t *Task) { s.tasks[t.ID] = t }
+ 
+ func (s *Store) DeleteTask(id string) { delete(s.tasks, id) }

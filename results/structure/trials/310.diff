@@ -1,0 +1,354 @@
+diff --git a/README.md b/README.md
+index dc46b90..25a741b 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/orgs/{orgID}/users/{uid}/transfer` | `{"toOrgId"}` → 200 `{"id","orgId"}` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +33,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Transferring a user (for moves between group companies) is allowed only to an org admin of the user's current organization. The actor must be in the path org (else 404), the user must belong to it (else 404), and the actor must be an org admin (else 403). The target must be an existing organization different from the current one (else 400).
++- A transfer takes the user out of every project of the old organization and unassigns the tasks they held there. The user loses org-admin rights.
+ 
+ ## Seed data
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..dbd7649 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -111,6 +111,18 @@ func (a *Authorizer) Authenticate(userID string) (ActorScope, error) {
+ type ActorScope interface {
+ 	Actor() Actor
+ 	Project(projectID string) ProjectScope
++	Org(orgID string) OrgScope
++}
++
++// OrgScope is bound to one actor and one organization ID.
++type OrgScope interface {
++	ID() string
++	User(userID string) UserScope
++}
++
++// UserScope is bound to one actor, one organization and one user ID.
++type UserScope interface {
++	Transfer() (TransferUser, error)
+ }
+ 
+ // ProjectScope is bound to one actor and one project ID. It grants nothing by
+@@ -139,6 +151,22 @@ func (s *actorScope) Actor() Actor { return s.actor }
+ func (s *actorScope) Project(projectID string) ProjectScope {
+ 	return &projectScope{as: s, pid: projectID}
+ }
++func (s *actorScope) Org(orgID string) OrgScope {
++	return &orgScope{as: s, oid: orgID}
++}
++
++type orgScope struct {
++	as  *actorScope
++	oid string
++}
++
++func (s *orgScope) ID() string                   { return s.oid }
++func (s *orgScope) User(userID string) UserScope { return &userScope{os: s, uid: userID} }
++
++type userScope struct {
++	os  *orgScope
++	uid string
++}
+ 
+ type projectScope struct {
+ 	as  *actorScope
+@@ -432,3 +460,85 @@ func (t *manageTask) Delete() error {
+ 		return nil
+ 	})
+ }
++
++// ---- user transfer capability --------------------------------------------------
++
++// UserView is the public representation of a user.
++type UserView struct {
++	ID    string `json:"id"`
++	OrgID string `json:"orgId"`
++}
++
++// TransferUser may move one user out of the organization it belongs to.
++type TransferUser interface {
++	// MoveTo moves the user to toOrgID. The user loses org-admin rights, is
++	// removed from every project of the old organization, and is unassigned from
++	// tasks in those projects, so the model invariants keep holding.
++	MoveTo(toOrgID string) (UserView, error)
++}
++
++// Transfer applies the transfer rule: the actor must belong to this
++// organization (else 404), the user must belong to it (else 404), and the actor
++// must be an org admin (else 403).
++func (s *userScope) Transfer() (TransferUser, error) {
++	err := s.os.as.a.st.read(func(st *state) error {
++		act := s.os.as.actor
++		if act.org != s.os.oid {
++			return deny(ErrNotFound, "not found")
++		}
++		u, ok := st.users[s.uid]
++		if !ok || u.org != s.os.oid {
++			return deny(ErrNotFound, "not found")
++		}
++		if !act.orgAdmin {
++			return deny(ErrForbidden, "forbidden")
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &transferUser{us: s}, nil
++}
++
++type transferUser struct{ us *userScope }
++
++func (t *transferUser) MoveTo(toOrgID string) (UserView, error) {
++	if toOrgID == "" {
++		return UserView{}, deny(ErrInvalid, "toOrgId is required")
++	}
++	var v UserView
++	err := t.us.os.as.a.st.tx(func(s *state) error {
++		u, ok := s.users[t.us.uid]
++		if !ok {
++			return deny(ErrNotFound, "not found")
++		}
++		fromOrg := u.org
++		if toOrgID == fromOrg {
++			return deny(ErrInvalid, "user already belongs to that organization")
++		}
++		if !s.orgExists(toOrgID) {
++			return deny(ErrInvalid, "unknown organization")
++		}
++
++		// Leave the old organization's projects and release the user's tasks there.
++		for pid, p := range s.projects {
++			if p.org == fromOrg {
++				delete(s.members[pid], u.id)
++			}
++		}
++		for id, tk := range s.tasks {
++			if tk.assignee.user == u.id && s.projects[tk.project].org == fromOrg {
++				tk.assignee = Assignee{project: tk.project}
++				s.tasks[id] = tk
++			}
++		}
++
++		u.org = toOrgID
++		u.orgAdmin = false
++		s.users[u.id] = u
++		v = UserView{ID: u.id, OrgID: u.org}
++		return nil
++	})
++	return v, err
++}
+diff --git a/internal/capability/state.go b/internal/capability/state.go
+index 57a31af..38dc4e4 100644
+--- a/internal/capability/state.go
++++ b/internal/capability/state.go
+@@ -111,6 +111,22 @@ func (s *state) check() error {
+ 	return nil
+ }
+ 
++// orgExists reports whether any user or project belongs to the organization.
++// Organizations have no table of their own; they exist through their members.
++func (s *state) orgExists(orgID string) bool {
++	for _, u := range s.users {
++		if u.org == orgID {
++			return true
++		}
++	}
++	for _, p := range s.projects {
++		if p.org == orgID {
++			return true
++		}
++	}
++	return false
++}
++
+ func (s *state) tasksIn(projectID string) []TaskView {
+ 	out := []TaskView{}
+ 	for _, t := range s.tasks {
+diff --git a/main.go b/main.go
+index 29de540..08edc60 100644
+--- a/main.go
++++ b/main.go
+@@ -46,6 +46,11 @@ type taskRegistry struct {
+ 	scope capability.TaskScope
+ }
+ 
++// userRegistry is the whole handler-visible surface under /orgs/{orgID}/users/{uid}.
++type userRegistry struct {
++	scope capability.UserScope
++}
++
+ func init() {
+ 	// tanukirpc logs every request through the default slog logger; keep the
+ 	// demo and test output quiet.
+@@ -78,9 +83,25 @@ func newServer() http.Handler {
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
+ 		})
+ 	})
++
++	tanukirpc.RouteWithTransformer(r, userTransformer(authz), "/orgs/{orgID}/users/{uid}", func(ur *tanukirpc.Router[*userRegistry]) {
++		ur.Post("/transfer", tanukirpc.NewHandler(transferUser))
++	})
+ 	return r
+ }
+ 
++// userTransformer authenticates the caller and binds the scope to {orgID} and {uid}.
++func userTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*rootRegistry, *userRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*rootRegistry]) (*userRegistry, error) {
++		actor, err := authz.Authenticate(ctx.Request().Header.Get("X-User"))
++		if err != nil {
++			return nil, err
++		}
++		r := ctx.Request()
++		return &userRegistry{scope: actor.Org(chi.URLParam(r, "orgID")).User(chi.URLParam(r, "uid"))}, nil
++	})
++}
++
+ // projectTransformer authenticates the caller and binds the scope to {pid}.
+ // The Authorizer stays in this closure; it is never put in a registry.
+ func projectTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*rootRegistry, *projectRegistry] {
+@@ -177,6 +198,26 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++type transferRequest struct {
++	ToOrgID string `json:"toOrgId"`
++}
++
++func transferUser(ctx tanukirpc.Context[*userRegistry], _ struct{}) (*capability.UserView, error) {
++	t, err := ctx.Registry().scope.Transfer()
++	if err != nil {
++		return nil, err
++	}
++	var req transferRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil {
++		return nil, errInvalidBody
++	}
++	v, err := t.MoveTo(req.ToOrgID)
++	if err != nil {
++		return nil, err
++	}
++	return &v, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // httpError is an error with an explicit status for request-shape problems
+diff --git a/main_test.go b/main_test.go
+index 0277f51..1515f31 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,100 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestTransfer(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"org admin moves member", "eve", "/orgs/acme/users/dan/transfer", `{"toOrgId":"globex"}`, 200},
++		{"project manager is not org admin", "ann", "/orgs/acme/users/dan/transfer", `{"toOrgId":"globex"}`, 403},
++		{"anonymous", "", "/orgs/acme/users/dan/transfer", `{"toOrgId":"globex"}`, 401},
++		{"unknown user", "zed", "/orgs/acme/users/dan/transfer", `{"toOrgId":"globex"}`, 401},
++		{"other org admin", "gus", "/orgs/acme/users/dan/transfer", `{"toOrgId":"globex"}`, 404},
++		{"user not in path org", "eve", "/orgs/acme/users/gus/transfer", `{"toOrgId":"acme"}`, 404},
++		{"unknown user id", "eve", "/orgs/acme/users/zed/transfer", `{"toOrgId":"globex"}`, 404},
++		{"unknown target org", "eve", "/orgs/acme/users/dan/transfer", `{"toOrgId":"initech"}`, 400},
++		{"same org", "eve", "/orgs/acme/users/dan/transfer", `{"toOrgId":"acme"}`, 400},
++		{"missing target", "eve", "/orgs/acme/users/dan/transfer", `{}`, 400},
++		{"bad body", "eve", "/orgs/acme/users/dan/transfer", `not json`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestTransferResponse(t *testing.T) {
++	code, body := do(t, newServer(), "POST", "/orgs/acme/users/dan/transfer", "eve", `{"toOrgId":"globex"}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200: %s", code, body)
++	}
++	var got struct {
++		ID    string `json:"id"`
++		OrgID string `json:"orgId"`
++	}
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	if got.ID != "dan" || got.OrgID != "globex" {
++		t.Fatalf("got %+v", got)
++	}
++}
++
++func TestTransferDetachesFromOldOrg(t *testing.T) {
++	srv := newServer()
++	// ben is a contributor on web and legacy, and is assigned t1 (web) and t5 (legacy).
++	if code, body := do(t, srv, "POST", "/orgs/acme/users/ben/transfer", "eve", `{"toOrgId":"globex"}`); code != 200 {
++		t.Fatalf("transfer: got %d: %s", code, body)
++	}
++
++	// ben's task in web is released, not deleted.
++	code, body := do(t, srv, "GET", "/projects/web/tasks/t1", "ann", "")
++	if code != 200 {
++		t.Fatalf("get t1: got %d: %s", code, body)
++	}
++	var task Task
++	if err := json.Unmarshal([]byte(body), &task); err != nil {
++		t.Fatal(err)
++	}
++	if task.Assignee != "" {
++		t.Fatalf("t1 still assigned to %q", task.Assignee)
++	}
++
++	// ben has lost access to the old org's projects and cannot write there.
++	for _, c := range []struct {
++		method, path, body string
++	}{
++		{"GET", "/projects/web/tasks", ""},
++		{"POST", "/projects/web/tasks", `{"title":"x"}`},
++		{"GET", "/projects/legacy/tasks", ""},
++		{"PATCH", "/projects/web/tasks/t1", `{"status":"done"}`},
++	} {
++		if code, _ := do(t, srv, c.method, c.path, "ben", c.body); code != 404 {
++			t.Fatalf("%s %s as ben: got %d want 404", c.method, c.path, code)
++		}
++	}
++}
++
++func TestTransferClearsOrgAdmin(t *testing.T) {
++	srv := newServer()
++	if code, body := do(t, srv, "POST", "/orgs/acme/users/eve/transfer", "eve", `{"toOrgId":"globex"}`); code != 200 {
++		t.Fatalf("transfer: got %d: %s", code, body)
++	}
++	// eve is now a globex user without org-admin rights, so she cannot move globex users.
++	if code, _ := do(t, srv, "POST", "/orgs/globex/users/gus/transfer", "eve", `{"toOrgId":"acme"}`); code != 403 {
++		t.Fatalf("got %d want 403", code)
++	}
++	// and she no longer sees acme projects.
++	if code, _ := do(t, srv, "GET", "/projects/web/tasks", "eve", ""); code != 404 {
++		t.Fatalf("got %d want 404", code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

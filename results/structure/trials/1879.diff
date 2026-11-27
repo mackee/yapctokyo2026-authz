@@ -1,0 +1,338 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..3266068 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,11 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| PUT | `/projects/{pid}/members` | `{"roles":{"ben":"viewer",...}}` → 200 `[{"userId","role"}]` (all members) |
++
++`PUT /members` is manager-only and all-or-nothing: an unknown role or a non-member → 400,
++a change that would leave the project without a manager → 409. Members demoted to
++`viewer` are unassigned from their tasks in the project.
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+diff --git a/main.go b/main.go
+index a75fde4..c1b40f0 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("PUT /projects/{pid}/members", s.setRoles)
+ 	return &appHandler{Handler: mux, db: db}
+ }
+ 
+diff --git a/members.go b/members.go
+new file mode 100644
+index 0000000..9d7c587
+--- /dev/null
++++ b/members.go
+@@ -0,0 +1,159 @@
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++)
++
++var validRoles = map[string]bool{RoleManager: true, RoleContributor: true, RoleViewer: true}
++
++type memberView struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++type setRolesRequest struct {
++	Roles map[string]string `json:"roles"`
++}
++
++// setRoles changes the roles of several project members at once. Only managers
++// may do it. It is all or nothing: if any entry is invalid, nothing changes.
++// A member who ends up as a viewer loses their task assignments in the project
++// (an assignee must be a contributor or manager), and the project must keep at
++// least one manager.
++func (s *server) setRoles(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role, err := findRole(ctx, s.db, project.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "only managers may change roles")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req setRolesRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Roles) == 0 {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	for _, newRole := range req.Roles {
++		if !validRoles[newRole] {
++			writeError(w, 400, "role must be manager, contributor or viewer")
++			return
++		}
++	}
++
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++
++	current := map[string]string{}
++	rows, err := tx.QueryContext(ctx, `SELECT user_id, role FROM memberships WHERE project_id = ?`, project.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	for rows.Next() {
++		var uid, rl string
++		if err := rows.Scan(&uid, &rl); err != nil {
++			rows.Close()
++			writeError(w, 500, "internal error")
++			return
++		}
++		current[uid] = rl
++	}
++	rows.Close()
++	if err := rows.Err(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++
++	for uid := range req.Roles {
++		if _, ok := current[uid]; !ok {
++			writeError(w, 400, "not a member of the project: "+uid)
++			return
++		}
++	}
++	managers := 0
++	for uid, rl := range current {
++		if nr, ok := req.Roles[uid]; ok {
++			rl = nr
++		}
++		if rl == RoleManager {
++			managers++
++		}
++	}
++	if managers == 0 {
++		writeError(w, 409, "a project must keep at least one manager")
++		return
++	}
++
++	for uid, newRole := range req.Roles {
++		if _, err := tx.ExecContext(ctx, `UPDATE memberships SET role = ? WHERE project_id = ? AND user_id = ?`, newRole, project.ID, uid); err != nil {
++			writeError(w, 500, "internal error")
++			return
++		}
++		if newRole == RoleViewer {
++			if _, err := tx.ExecContext(ctx, `UPDATE tasks SET assignee = '' WHERE project_id = ? AND assignee = ?`, project.ID, uid); err != nil {
++				writeError(w, 500, "internal error")
++				return
++			}
++		}
++	}
++
++	out := []memberView{}
++	rows, err = tx.QueryContext(ctx, `SELECT user_id, role FROM memberships WHERE project_id = ? ORDER BY user_id`, project.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	for rows.Next() {
++		var m memberView
++		if err := rows.Scan(&m.UserID, &m.Role); err != nil {
++			rows.Close()
++			writeError(w, 500, "internal error")
++			return
++		}
++		out = append(out, m)
++	}
++	rows.Close()
++	if err := rows.Err(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, out)
++}
+diff --git a/members_test.go b/members_test.go
+new file mode 100644
+index 0000000..0957d68
+--- /dev/null
++++ b/members_test.go
+@@ -0,0 +1,139 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++type member struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++func roleMap(t *testing.T, body string) map[string]string {
++	t.Helper()
++	var ms []member
++	if err := json.Unmarshal([]byte(body), &ms); err != nil {
++		t.Fatalf("bad body %q: %v", body, err)
++	}
++	m := map[string]string{}
++	for _, x := range ms {
++		m[x.UserID] = x.Role
++	}
++	return m
++}
++
++func TestBulkRolesStatus(t *testing.T) {
++	cases := []struct {
++		name, user, project, body string
++		want                      int
++	}{
++		{"manager changes", "ann", "web", `{"roles":{"ben":"viewer","dan":"contributor"}}`, 200},
++		{"promote to manager", "ann", "web", `{"roles":{"dan":"manager"}}`, 200},
++		{"manager demotes self when another manager remains", "ann", "web", `{"roles":{"ann":"viewer"}}`, 200},
++		{"contributor", "ben", "web", `{"roles":{"dan":"contributor"}}`, 403},
++		{"viewer", "dan", "web", `{"roles":{"dan":"manager"}}`, 403},
++		{"org admin", "eve", "web", `{"roles":{"dan":"contributor"}}`, 403},
++		{"non member", "hal", "web", `{"roles":{"dan":"contributor"}}`, 404},
++		{"other org", "gus", "web", `{"roles":{"dan":"contributor"}}`, 404},
++		{"anonymous", "", "web", `{"roles":{"dan":"contributor"}}`, 401},
++		{"unknown project", "ann", "nope", `{"roles":{"dan":"contributor"}}`, 404},
++		{"archived", "ann", "legacy", `{"roles":{"ben":"viewer"}}`, 409},
++		{"invalid role", "ann", "web", `{"roles":{"dan":"boss"}}`, 400},
++		{"target not a member", "ann", "web", `{"roles":{"hal":"viewer"}}`, 400},
++		{"target in other org", "ann", "web", `{"roles":{"gus":"viewer"}}`, 400},
++		{"empty roles", "ann", "web", `{"roles":{}}`, 400},
++		{"missing roles", "ann", "web", `{}`, 400},
++		{"bad json", "ann", "web", `nope`, 400},
++		{"would leave no manager", "ann", "ops", `{"roles":{"ivy":"viewer"}}`, 200}, // ops keeps no... see below
++	}
++	// ops has managers: ivy only. Demoting ivy leaves none -> must be refused.
++	cases[len(cases)-1].want = 409
++	cases = append(cases, struct {
++		name, user, project, body string
++		want                      int
++	}{"demote all managers", "ann", "web", `{"roles":{"ann":"viewer","ivy":"contributor"}}`, 409})
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			user := c.user
++			if c.name == "would leave no manager" {
++				user = "ivy"
++			}
++			code, body := do(t, newServer(), "PUT", "/projects/"+c.project+"/members", user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d (%s)", code, c.want, body)
++			}
++		})
++	}
++}
++
++func TestBulkRolesResult(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"ben":"viewer","dan":"contributor"}}`)
++	if code != 200 {
++		t.Fatal(code, body)
++	}
++	got := roleMap(t, body)
++	want := map[string]string{"ann": "manager", "ben": "viewer", "cat": "contributor", "dan": "contributor", "ivy": "manager"}
++	if len(got) != len(want) {
++		t.Fatalf("got %v want %v", got, want)
++	}
++	for k, v := range want {
++		if got[k] != v {
++			t.Fatalf("got %v want %v", got, want)
++		}
++	}
++	// the change persisted: dan can now create tasks, ben cannot
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`); code != 200 {
++		t.Fatalf("dan create: %d", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "ben", `{"title":"x"}`); code != 403 {
++		t.Fatalf("ben create: %d", code)
++	}
++}
++
++func TestBulkRolesAtomic(t *testing.T) {
++	h := newServer()
++	// dan is valid, hal is not a member: nothing may change.
++	code, _ := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"dan":"contributor","hal":"viewer"}}`)
++	if code != 400 {
++		t.Fatalf("got %d", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`); code != 403 {
++		t.Fatalf("dan was changed despite failure: %d", code)
++	}
++	// same with an invalid role after a valid one
++	code, _ = do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"dan":"contributor","ben":"boss"}}`)
++	if code != 400 {
++		t.Fatalf("got %d", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`); code != 403 {
++		t.Fatalf("dan was changed despite failure: %d", code)
++	}
++}
++
++// Demoting an assignee to viewer must not leave them assigned (model rules are
++// checked by do()); their tasks become unassigned, other tasks are untouched.
++func TestBulkRolesDemotedAssigneeUnassigned(t *testing.T) {
++	h := newServer()
++	if code, body := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"ben":"viewer"}}`); code != 200 {
++		t.Fatal(code, body)
++	}
++	_, body := do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
++	var task Task
++	json.Unmarshal([]byte(body), &task)
++	if task.Assignee != "" {
++		t.Fatalf("t1 assignee %q", task.Assignee)
++	}
++	_, body = do(t, h, "GET", "/projects/web/tasks/t2", "ann", "")
++	json.Unmarshal([]byte(body), &task)
++	if task.Assignee != "cat" {
++		t.Fatalf("t2 assignee %q", task.Assignee)
++	}
++	// ben's task in another project is unaffected
++	_, body = do(t, h, "GET", "/projects/legacy/tasks/t5", "ann", "")
++	json.Unmarshal([]byte(body), &task)
++	if task.Assignee != "ben" {
++		t.Fatalf("t5 assignee %q", task.Assignee)
++	}
++}

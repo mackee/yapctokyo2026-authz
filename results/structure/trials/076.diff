@@ -1,0 +1,259 @@
+diff --git a/README.md b/README.md
+index ba637dd..04cca92 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/orgs/{orgID}/users/{uid}/out-of-office` | `{"delegate"}` → 200 with the moved tasks; org admins only |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -33,6 +34,16 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
++### Out-of-office delegation
++
++`POST /orgs/{orgID}/users/{uid}/out-of-office` with `{"delegate":"cat"}` reassigns every task assigned to `{uid}` in the organization's active projects to `delegate`, and returns the moved tasks (200).
++
++- Only org admins of `{orgID}` may call it (other callers: 403; callers from another org: 404). This is the one write org admins may perform.
++- `{uid}` must belong to `{orgID}`, otherwise 404.
++- `delegate` must be a different user in the same organization, and a contributor or manager of every affected project, otherwise 400.
++- Tasks in archived projects are not moved, because archived projects reject writes.
++- All-or-nothing: if any check fails, no task is changed.
++
+ ## Seed data
+ 
+ | User | Org | Roles |
+diff --git a/main.go b/main.go
+index 6152a73..411fb92 100644
+--- a/main.go
++++ b/main.go
+@@ -22,6 +22,8 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - out-of-office delegation: only org admins of the org may move a user's
++//     tasks to a delegate; this is the one write org admins may perform
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -42,6 +44,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /orgs/{orgID}/users/{uid}/out-of-office", s.outOfOffice)
+ 	return mux
+ }
+ 
+@@ -282,3 +285,73 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	s.store.DeleteTask(task.ID)
+ 	w.WriteHeader(204)
+ }
++
++type outOfOfficeRequest struct {
++	Delegate string `json:"delegate"`
++}
++
++// outOfOffice moves every task assigned to {uid} in the organization to the
++// delegate and returns the moved tasks. Tasks in archived projects are left
++// alone, since archived projects reject writes. The operation is all-or-nothing:
++// if the delegate is not a contributor or manager of an affected project,
++// nothing is changed.
++func (s *server) outOfOffice(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	caller := s.store.User(r.Header.Get("X-User"))
++	if caller == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	orgID := r.PathValue("orgID")
++	if caller.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if !caller.OrgAdmin {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	uid := r.PathValue("uid")
++	target := s.store.User(uid)
++	if target == nil || target.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	var req outOfOfficeRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Delegate == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	if req.Delegate == uid {
++		writeError(w, 400, "delegate must be a different user")
++		return
++	}
++	delegate := s.store.User(req.Delegate)
++	if delegate == nil || delegate.OrgID != orgID {
++		writeError(w, 400, "delegate must belong to the organization")
++		return
++	}
++
++	var moved []*Task
++	for _, t := range s.store.TasksAssignedTo(uid) {
++		project := s.store.Project(t.ProjectID)
++		if project == nil || project.OrgID != orgID || project.Archived {
++			continue
++		}
++		role := s.store.Role(project.ID, delegate.ID)
++		if role != RoleManager && role != RoleContributor {
++			writeError(w, 400, "delegate must be a contributor or manager of project "+project.ID)
++			return
++		}
++		moved = append(moved, t)
++	}
++	for _, t := range moved {
++		t.Assignee = delegate.ID
++	}
++	if moved == nil {
++		moved = []*Task{}
++	}
++	writeJSON(w, 200, moved)
++}
+diff --git a/out_of_office_test.go b/out_of_office_test.go
+new file mode 100644
+index 0000000..1f70b7a
+--- /dev/null
++++ b/out_of_office_test.go
+@@ -0,0 +1,97 @@
++package main
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestOutOfOfficeAccess(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"org admin delegates", "eve", "/orgs/acme/users/ben/out-of-office", `{"delegate":"cat"}`, 200},
++		{"manager is not org admin", "ann", "/orgs/acme/users/ben/out-of-office", `{"delegate":"cat"}`, 403},
++		{"contributor is not org admin", "ben", "/orgs/acme/users/ben/out-of-office", `{"delegate":"cat"}`, 403},
++		{"anonymous", "", "/orgs/acme/users/ben/out-of-office", `{"delegate":"cat"}`, 401},
++		{"unknown caller", "zed", "/orgs/acme/users/ben/out-of-office", `{"delegate":"cat"}`, 401},
++		{"admin of other org", "eve", "/orgs/globex/users/gus/out-of-office", `{"delegate":"gus"}`, 404},
++		{"other org caller", "gus", "/orgs/acme/users/ben/out-of-office", `{"delegate":"cat"}`, 404},
++		{"unknown user", "eve", "/orgs/acme/users/zed/out-of-office", `{"delegate":"cat"}`, 404},
++		{"user in other org", "eve", "/orgs/acme/users/gus/out-of-office", `{"delegate":"cat"}`, 404},
++		{"missing delegate", "eve", "/orgs/acme/users/ben/out-of-office", `{}`, 400},
++		{"bad body", "eve", "/orgs/acme/users/ben/out-of-office", `not json`, 400},
++		{"delegate is self", "eve", "/orgs/acme/users/ben/out-of-office", `{"delegate":"ben"}`, 400},
++		{"delegate unknown", "eve", "/orgs/acme/users/ben/out-of-office", `{"delegate":"zed"}`, 400},
++		{"delegate in other org", "eve", "/orgs/acme/users/ben/out-of-office", `{"delegate":"gus"}`, 400},
++		{"delegate is viewer", "eve", "/orgs/acme/users/ben/out-of-office", `{"delegate":"dan"}`, 400},
++		{"delegate not in project", "eve", "/orgs/acme/users/cat/out-of-office", `{"delegate":"ben"}`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestOutOfOfficeMovesOnlyActiveTasks(t *testing.T) {
++	srv := newServer()
++	code, body := do(t, srv, "POST", "/orgs/acme/users/ben/out-of-office", "eve", `{"delegate":"cat"}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var moved []Task
++	if err := json.Unmarshal([]byte(body), &moved); err != nil {
++		t.Fatal(err)
++	}
++	if len(moved) != 1 || moved[0].ID != "t1" || moved[0].Assignee != "cat" {
++		t.Fatalf("want [t1 assigned to cat], got %s", body)
++	}
++
++	// The change is visible through the normal API.
++	_, body = do(t, srv, "GET", "/projects/web/tasks/t1", "ann", "")
++	var task Task
++	json.Unmarshal([]byte(body), &task)
++	if task.Assignee != "cat" {
++		t.Fatalf("t1 assignee = %q, want cat", task.Assignee)
++	}
++
++	// Ben's task in the archived project is left untouched.
++	_, body = do(t, srv, "GET", "/projects/legacy/tasks/t5", "ann", "")
++	json.Unmarshal([]byte(body), &task)
++	if task.Assignee != "ben" {
++		t.Fatalf("archived t5 assignee = %q, want ben", task.Assignee)
++	}
++}
++
++func TestOutOfOfficeIsAllOrNothing(t *testing.T) {
++	srv := newServer()
++	// cat holds t2 (web) and t4 (ops). ben is a contributor in web but not in ops,
++	// so the operation must fail and leave t2 unchanged even though it could move.
++	code, _ := do(t, srv, "POST", "/orgs/acme/users/cat/out-of-office", "eve", `{"delegate":"ben"}`)
++	if code != 400 {
++		t.Fatalf("got %d want 400", code)
++	}
++	for _, path := range []string{"/projects/web/tasks/t2", "/projects/ops/tasks/t4"} {
++		_, body := do(t, srv, "GET", path, "ann", "")
++		var task Task
++		json.Unmarshal([]byte(body), &task)
++		if task.Assignee != "cat" {
++			t.Fatalf("%s assignee = %q, want cat", path, task.Assignee)
++		}
++	}
++}
++
++func TestOutOfOfficeNoTasks(t *testing.T) {
++	code, body := do(t, newServer(), "POST", "/orgs/acme/users/hal/out-of-office", "eve", `{"delegate":"cat"}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	if strings.TrimSpace(body) != "[]" {
++		t.Fatalf("want [], got %s", body)
++	}
++}
+diff --git a/store.go b/store.go
+index f468b2d..082e7c8 100644
+--- a/store.go
++++ b/store.go
+@@ -9,7 +9,7 @@ import (
+ type User struct {
+ 	ID       string
+ 	OrgID    string
+-	OrgAdmin bool // org admins may read every project in their org, but cannot write
++	OrgAdmin bool // org admins may read every project in their org, but cannot write (except out-of-office delegation)
+ }
+ 
+ type Project struct {
+@@ -64,6 +64,18 @@ func (s *Store) TasksInProject(projectID string) []*Task {
+ 	return out
+ }
+ 
++// TasksAssignedTo returns all tasks assigned to userID, across every project, sorted by ID.
++func (s *Store) TasksAssignedTo(userID string) []*Task {
++	var out []*Task
++	for _, t := range s.tasks {
++		if t.Assignee == userID {
++			out = append(out, t)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
++	return out
++}
++
+ func (s *Store) NewTaskID() string {
+ 	s.nextID++
+ 	return fmt.Sprintf("t%d", s.nextID)

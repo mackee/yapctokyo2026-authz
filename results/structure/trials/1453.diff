@@ -1,0 +1,252 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..0e6b7da 100644
+--- a/README.md
++++ b/README.md
+@@ -21,8 +21,9 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| PUT | `/projects/{pid}/members/{uid}` | `{"role"}` → 200 `{"userId","role"}` |
+ 
+-Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
++Statuses: `open`, `doing`, `done`. Roles: `manager`, `contributor`, `viewer`. Errors are `{"error":"..."}`.
+ 
+ ## Access rules
+ 
+@@ -32,6 +33,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Only managers may change member roles. A member ID that is not a member of the project → 404.
++- A member who still has assigned tasks in the project cannot be set to `viewer` (409); reassign those tasks first. Assignees must be contributors or managers.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/db.go b/db.go
+index b52fe89..63aacfb 100644
+--- a/db.go
++++ b/db.go
+@@ -26,6 +26,8 @@ const (
+ 
+ var validStatuses = map[string]bool{"open": true, "doing": true, "done": true}
+ 
++var validRoles = map[string]bool{RoleManager: true, RoleContributor: true, RoleViewer: true}
++
+ const schema = `
+ CREATE TABLE users (
+ 	id        TEXT PRIMARY KEY,
+diff --git a/main.go b/main.go
+index a75fde4..815b6d4 100644
+--- a/main.go
++++ b/main.go
+@@ -23,8 +23,11 @@ import (
+ //   - contributors may only modify tasks assigned to themselves
+ //     and may not reassign tasks; managers may modify any task
+ //   - only managers may delete tasks
++//   - only managers may change member roles
++//   - a member with assigned tasks cannot be demoted to viewer -> 409
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - a member ID that is not a member of the path project    -> 404
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -49,6 +52,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("PUT /projects/{pid}/members/{uid}", s.setMemberRole)
+ 	return &appHandler{Handler: mux, db: db}
+ }
+ 
+@@ -464,3 +468,85 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	w.WriteHeader(204)
+ }
++
++type roleRequest struct {
++	Role string `json:"role"`
++}
++
++type memberResponse struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++func (s *server) setMemberRole(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role, err := findRole(ctx, s.db, project.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "only managers may change member roles")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	targetID := r.PathValue("uid")
++	targetRole, err := findRole(ctx, s.db, project.ID, targetID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if targetRole == "" {
++		writeError(w, 404, "not found")
++		return
++	}
++	var req roleRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !validRoles[req.Role] {
++		writeError(w, 400, "role must be manager, contributor or viewer")
++		return
++	}
++	if req.Role == RoleViewer {
++		// Assignees must be contributors or managers, so a member who still
++		// holds tasks in this project cannot become a viewer.
++		var assigned int
++		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE project_id = ? AND assignee = ?`, project.ID, targetID).Scan(&assigned); err != nil {
++			writeError(w, 500, "internal error")
++			return
++		}
++		if assigned > 0 {
++			writeError(w, 409, "member still has assigned tasks; reassign them first")
++			return
++		}
++	}
++	if _, err := s.db.ExecContext(ctx, `UPDATE memberships SET role = ? WHERE project_id = ? AND user_id = ?`,
++		req.Role, project.ID, targetID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, memberResponse{UserID: targetID, Role: req.Role})
++}
+diff --git a/members_test.go b/members_test.go
+new file mode 100644
+index 0000000..8e92b1e
+--- /dev/null
++++ b/members_test.go
+@@ -0,0 +1,99 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestSetMemberRole(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager promotes viewer", "ann", "/projects/web/members/dan", `{"role":"contributor"}`, 200},
++		{"manager demotes member without tasks", "ann", "/projects/web/members/ivy", `{"role":"viewer"}`, 200},
++		{"manager promotes contributor", "ann", "/projects/web/members/ben", `{"role":"manager"}`, 200},
++		{"manager sets same role", "ann", "/projects/web/members/cat", `{"role":"contributor"}`, 200},
++		{"demote member with assigned tasks", "ann", "/projects/web/members/ben", `{"role":"viewer"}`, 409},
++		{"contributor caller", "ben", "/projects/web/members/dan", `{"role":"contributor"}`, 403},
++		{"viewer caller", "dan", "/projects/web/members/ben", `{"role":"viewer"}`, 403},
++		{"org admin caller", "eve", "/projects/web/members/dan", `{"role":"contributor"}`, 403},
++		{"non member caller", "hal", "/projects/web/members/dan", `{"role":"contributor"}`, 404},
++		{"other org caller", "gus", "/projects/web/members/ben", `{"role":"viewer"}`, 404},
++		{"anonymous", "", "/projects/web/members/dan", `{"role":"contributor"}`, 401},
++		{"unknown user", "zed", "/projects/web/members/dan", `{"role":"contributor"}`, 401},
++		{"missing project", "ann", "/projects/nope/members/dan", `{"role":"contributor"}`, 404},
++		{"target not a member", "ann", "/projects/web/members/hal", `{"role":"contributor"}`, 404},
++		{"unknown role", "ann", "/projects/web/members/dan", `{"role":"owner"}`, 400},
++		{"missing role", "ann", "/projects/web/members/dan", `{}`, 400},
++		{"bad body", "ann", "/projects/web/members/dan", `not json`, 400},
++		{"archived", "ann", "/projects/legacy/members/ben", `{"role":"viewer"}`, 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "PUT", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestSetMemberRoleResponse(t *testing.T) {
++	code, body := do(t, newServer(), "PUT", "/projects/web/members/dan", "ann", `{"role":"manager"}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200: %s", code, body)
++	}
++	var got struct {
++		UserID string `json:"userId"`
++		Role   string `json:"role"`
++	}
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	if got.UserID != "dan" || got.Role != "manager" {
++		t.Fatalf("got %+v", got)
++	}
++}
++
++func TestSetMemberRoleTakesEffect(t *testing.T) {
++	h := newServer()
++
++	// dan starts as a viewer and cannot create tasks.
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`); code != 403 {
++		t.Fatalf("viewer create: got %d want 403", code)
++	}
++	if code, _ := do(t, h, "PUT", "/projects/web/members/dan", "ann", `{"role":"contributor"}`); code != 200 {
++		t.Fatalf("promote: got %d want 200", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`); code != 200 {
++		t.Fatalf("contributor create: got %d want 200", code)
++	}
++
++	// ivy is a manager with no assigned tasks; once demoted she can still read but not write.
++	if code, _ := do(t, h, "PUT", "/projects/web/members/ivy", "ann", `{"role":"viewer"}`); code != 200 {
++		t.Fatalf("demote: got %d want 200", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ivy", ""); code != 200 {
++		t.Fatalf("viewer read: got %d want 200", code)
++	}
++	if code, _ := do(t, h, "PATCH", "/projects/web/tasks/t3", "ivy", `{"status":"done"}`); code != 403 {
++		t.Fatalf("viewer patch: got %d want 403", code)
++	}
++}
++
++func TestDemoteBlockedUntilTasksReassigned(t *testing.T) {
++	h := newServer()
++
++	// ben holds t1, so demotion is refused and nothing changes.
++	if code, _ := do(t, h, "PUT", "/projects/web/members/ben", "ann", `{"role":"viewer"}`); code != 409 {
++		t.Fatalf("got %d want 409", code)
++	}
++	// After ann reassigns t1 to ann, the demotion goes through.
++	if code, _ := do(t, h, "PATCH", "/projects/web/tasks/t1", "ann", `{"assignee":"ann"}`); code != 200 {
++		t.Fatalf("reassign: got %d want 200", code)
++	}
++	if code, _ := do(t, h, "PUT", "/projects/web/members/ben", "ann", `{"role":"viewer"}`); code != 200 {
++		t.Fatalf("demote after reassign: got %d want 200", code)
++	}
++}

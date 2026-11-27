@@ -1,0 +1,253 @@
+diff --git a/README.md b/README.md
+index ba637dd..d99f4df 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,9 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| PUT | `/projects/{pid}/members` | `{"roles":{"<userId>":"<role>",...}}` → 200 with the full member list `[{"userId","role"}]` (sorted by `userId`) |
++
++Roles: `manager`, `contributor`, `viewer`.
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -32,6 +35,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Only managers may change member roles. Org admins without a project role get 403.
++- A role change batch is all-or-nothing: every role must be valid and every target must already be a member of the project, otherwise → 400 and nothing changes.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 6152a73..9c54b71 100644
+--- a/main.go
++++ b/main.go
+@@ -5,6 +5,7 @@ import (
+ 	"flag"
+ 	"log"
+ 	"net/http"
++	"sort"
+ )
+ 
+ // Taskboard: a tiny project task tracker.
+@@ -22,6 +23,8 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - only managers may change member roles; the batch is all-or-nothing:
++//     any invalid role or non-member target                   -> 400, nothing changed
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -35,13 +38,17 @@ type server struct {
+ }
+ 
+ func newServer() http.Handler {
+-	s := &server{store: newSeededStore()}
++	return (&server{store: newSeededStore()}).routes()
++}
++
++func (s *server) routes() http.Handler {
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("GET /projects/{pid}/tasks", s.listTasks)
+ 	mux.HandleFunc("POST /projects/{pid}/tasks", s.createTask)
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("PUT /projects/{pid}/members", s.updateMemberRoles)
+ 	return mux
+ }
+ 
+@@ -282,3 +289,63 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	s.store.DeleteTask(task.ID)
+ 	w.WriteHeader(204)
+ }
++
++type memberRolesRequest struct {
++	Roles map[string]string `json:"roles"`
++}
++
++// updateMemberRoles changes several members' roles in one request. The batch is
++// validated in full before anything is applied, so it either applies entirely or
++// not at all.
++func (s *server) updateMemberRoles(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	user := s.store.User(r.Header.Get("X-User"))
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project := s.store.Project(r.PathValue("pid"))
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role := s.store.Role(project.ID, user.ID)
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "only managers may change member roles")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req memberRolesRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || len(req.Roles) == 0 {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	userIDs := make([]string, 0, len(req.Roles))
++	for uid := range req.Roles {
++		userIDs = append(userIDs, uid)
++	}
++	sort.Strings(userIDs)
++	for _, uid := range userIDs {
++		if !validRoles[req.Roles[uid]] {
++			writeError(w, 400, "invalid role for "+uid)
++			return
++		}
++		if s.store.Role(project.ID, uid) == "" {
++			writeError(w, 400, uid+" is not a member of the project")
++			return
++		}
++	}
++	for _, uid := range userIDs {
++		s.store.SetRole(project.ID, uid, req.Roles[uid])
++	}
++	writeJSON(w, 200, s.store.MembersOf(project.ID))
++}
+diff --git a/main_test.go b/main_test.go
+index 0277f51..b8f4270 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,83 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestUpdateMemberRoles(t *testing.T) {
++	cases := []struct {
++		name, user, project, body string
++		want                      int
++	}{
++		{"manager batch", "ann", "web", `{"roles":{"ben":"viewer","dan":"contributor"}}`, 200},
++		{"contributor caller", "ben", "web", `{"roles":{"cat":"viewer"}}`, 403},
++		{"viewer caller", "dan", "web", `{"roles":{"cat":"viewer"}}`, 403},
++		{"org admin caller", "eve", "web", `{"roles":{"cat":"viewer"}}`, 403},
++		{"non member caller", "hal", "web", `{"roles":{"cat":"viewer"}}`, 404},
++		{"other org caller", "gus", "web", `{"roles":{"cat":"viewer"}}`, 404},
++		{"anonymous", "", "web", `{"roles":{"cat":"viewer"}}`, 401},
++		{"unknown user", "zed", "web", `{"roles":{"cat":"viewer"}}`, 401},
++		{"unknown project", "ann", "nope", `{"roles":{"cat":"viewer"}}`, 404},
++		{"archived", "ann", "legacy", `{"roles":{"ben":"viewer"}}`, 409},
++		{"invalid role", "ann", "web", `{"roles":{"ben":"viewer","cat":"owner"}}`, 400},
++		{"empty role", "ann", "web", `{"roles":{"ben":""}}`, 400},
++		{"target not member", "ann", "web", `{"roles":{"ben":"viewer","hal":"viewer"}}`, 400},
++		{"target in other org", "ann", "web", `{"roles":{"gus":"viewer"}}`, 400},
++		{"empty roles", "ann", "web", `{"roles":{}}`, 400},
++		{"missing roles", "ann", "web", `{}`, 400},
++		{"bad json", "ann", "web", `{"roles":`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "PUT", "/projects/"+c.project+"/members", c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestUpdateMemberRolesApplies(t *testing.T) {
++	code, body := do(t, newServer(), "PUT", "/projects/web/members", "ann",
++		`{"roles":{"ben":"viewer","dan":"contributor"}}`)
++	if code != 200 {
++		t.Fatalf("got %d: %s", code, body)
++	}
++	var got []Member
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatal(err)
++	}
++	want := []Member{
++		{UserID: "ann", Role: RoleManager},
++		{UserID: "ben", Role: RoleViewer},
++		{UserID: "cat", Role: RoleContributor},
++		{UserID: "dan", Role: RoleContributor},
++		{UserID: "ivy", Role: RoleManager},
++	}
++	if len(got) != len(want) {
++		t.Fatalf("got %d members want %d: %s", len(got), len(want), body)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("member %d: got %+v want %+v", i, got[i], want[i])
++		}
++	}
++}
++
++func TestUpdateMemberRolesIsAllOrNothing(t *testing.T) {
++	s := &server{store: newSeededStore()}
++	h := s.routes()
++	// ben -> viewer is valid, but hal is not a member, so the whole batch must be rejected.
++	code, _ := do(t, h, "PUT", "/projects/web/members", "ann",
++		`{"roles":{"ben":"viewer","hal":"viewer"}}`)
++	if code != 400 {
++		t.Fatalf("got %d want 400", code)
++	}
++	if got := s.store.Role("web", "ben"); got != RoleContributor {
++		t.Fatalf("ben's role changed to %q after rejected batch", got)
++	}
++	if got := s.store.Role("web", "dan"); got != RoleViewer {
++		t.Fatalf("dan's role changed to %q after rejected batch", got)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string
+diff --git a/store.go b/store.go
+index f468b2d..6d627b2 100644
+--- a/store.go
++++ b/store.go
+@@ -36,6 +36,14 @@ const (
+ 
+ var validStatuses = map[string]bool{"open": true, "doing": true, "done": true}
+ 
++var validRoles = map[string]bool{RoleManager: true, RoleContributor: true, RoleViewer: true}
++
++// Member is one entry of a project's member list.
++type Member struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
+ type Store struct {
+ 	mu       sync.Mutex
+ 	users    map[string]*User
+@@ -53,6 +61,18 @@ func (s *Store) Role(projectID, userID string) string { return s.members[project
+ 
+ func (s *Store) Task(id string) *Task { return s.tasks[id] }
+ 
++// MembersOf returns the project's members sorted by user ID.
++func (s *Store) MembersOf(projectID string) []Member {
++	out := []Member{}
++	for uid, role := range s.members[projectID] {
++		out = append(out, Member{UserID: uid, Role: role})
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].UserID < out[j].UserID })
++	return out
++}
++
++func (s *Store) SetRole(projectID, userID, role string) { s.members[projectID][userID] = role }
++
+ func (s *Store) TasksInProject(projectID string) []*Task {
+ 	var out []*Task
+ 	for _, t := range s.tasks {

@@ -1,0 +1,230 @@
+diff --git a/README.md b/README.md
+index 8d54490..4aceb09 100644
+--- a/README.md
++++ b/README.md
+@@ -20,6 +20,13 @@ go test ./...
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
+ 
++| DELETE | `/orgs/{orgID}/users/{uid}` | offboarding, org admins only → 204 |
++
++`DELETE /orgs/{orgID}/users/{uid}` removes the user from every project of the
++organization (archived ones included) and unassigns their tasks there. Callers
++who are not org admins get 403; another organization, or a user outside the
++organization, is 404.
++
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+ ## Access rules
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..199a6fa 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -111,6 +111,7 @@ func (a *Authorizer) Authenticate(userID string) (ActorScope, error) {
+ type ActorScope interface {
+ 	Actor() Actor
+ 	Project(projectID string) ProjectScope
++	Org(orgID string) OrgScope
+ }
+ 
+ // ProjectScope is bound to one actor and one project ID. It grants nothing by
+@@ -130,12 +131,68 @@ type TaskScope interface {
+ 	Manage() (ManageTask, error)
+ }
+ 
++// OrgScope is bound to one actor and one organization ID.
++type OrgScope interface {
++	// Manage applies the org-admin rule: the organization is the actor's own
++	// (else 404) and the actor is an org admin (else 403).
++	Manage() (ManageOrg, error)
++}
++
++// ManageOrg is the org-admin capability for one organization.
++type ManageOrg interface {
++	// RemoveUser takes a user out of every project of the organization
++	// (offboarding) and unassigns their tasks there, archived projects
++	// included. A user who is not in the organization is 404. Atomic.
++	RemoveUser(userID string) error
++}
++
+ type actorScope struct {
+ 	a     *Authorizer
+ 	actor Actor
+ }
+ 
+ func (s *actorScope) Actor() Actor { return s.actor }
++func (s *actorScope) Org(orgID string) OrgScope {
++	return &orgScope{as: s, oid: orgID}
++}
++
++type orgScope struct {
++	as  *actorScope
++	oid string
++}
++
++func (s *orgScope) Manage() (ManageOrg, error) {
++	act := s.as.actor
++	if act.org != s.oid {
++		return nil, deny(ErrNotFound, "not found")
++	}
++	if !act.orgAdmin {
++		return nil, deny(ErrForbidden, "forbidden")
++	}
++	return &manageOrg{os: s}, nil
++}
++
++type manageOrg struct{ os *orgScope }
++
++func (m *manageOrg) RemoveUser(userID string) error {
++	return m.os.as.a.st.tx(func(s *state) error {
++		if u, ok := s.users[userID]; !ok || u.org != m.os.oid {
++			return deny(ErrNotFound, "not found")
++		}
++		for pid, members := range s.members {
++			if s.projects[pid].org == m.os.oid {
++				delete(members, userID)
++			}
++		}
++		for id, t := range s.tasks {
++			if t.assignee.user == userID {
++				t.assignee = Assignee{project: t.project}
++				s.tasks[id] = t
++			}
++		}
++		return nil
++	})
++}
+ func (s *actorScope) Project(projectID string) ProjectScope {
+ 	return &projectScope{as: s, pid: projectID}
+ }
+diff --git a/main.go b/main.go
+index 29de540..32aa077 100644
+--- a/main.go
++++ b/main.go
+@@ -36,6 +36,11 @@ type Task = capability.TaskView
+ 
+ type rootRegistry struct{}
+ 
++// orgRegistry is the whole handler-visible surface under /orgs/{orgID}.
++type orgRegistry struct {
++	scope capability.OrgScope
++}
++
+ // projectRegistry is the whole handler-visible surface under /projects/{pid}.
+ type projectRegistry struct {
+ 	scope capability.ProjectScope
+@@ -68,6 +73,10 @@ func newServer() http.Handler {
+ 		tanukirpc.WithAccessLogger[*rootRegistry](nil),
+ 	)
+ 
++	tanukirpc.RouteWithTransformer(r, orgTransformer(authz), "/orgs/{orgID}", func(or *tanukirpc.Router[*orgRegistry]) {
++		or.Delete("/users/{uid}", tanukirpc.NewHandler(removeOrgUser))
++	})
++
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(authz), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
+@@ -93,6 +102,17 @@ func projectTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*roo
+ 	})
+ }
+ 
++// orgTransformer authenticates the caller and binds the scope to {orgID}.
++func orgTransformer(authz *capability.Authorizer) tanukirpc.Transformer[*rootRegistry, *orgRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*rootRegistry]) (*orgRegistry, error) {
++		actor, err := authz.Authenticate(ctx.Request().Header.Get("X-User"))
++		if err != nil {
++			return nil, err
++		}
++		return &orgRegistry{scope: actor.Org(chi.URLParam(ctx.Request(), "orgID"))}, nil
++	})
++}
++
+ func taskTransformer() tanukirpc.Transformer[*projectRegistry, *taskRegistry] {
+ 	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*projectRegistry]) (*taskRegistry, error) {
+ 		return &taskRegistry{scope: ctx.Registry().scope.Task(chi.URLParam(ctx.Request(), "tid"))}, nil
+@@ -177,6 +197,19 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++// removeOrgUser offboards a user: removes them from every project of the org.
++func removeOrgUser(ctx tanukirpc.Context[*orgRegistry], _ struct{}) (*struct{}, error) {
++	o, err := ctx.Registry().scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	if err := o.RemoveUser(chi.URLParam(ctx.Request(), "uid")); err != nil {
++		return nil, err
++	}
++	ctx.Response().WriteHeader(http.StatusNoContent)
++	return nil, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // httpError is an error with an explicit status for request-shape problems
+diff --git a/main_test.go b/main_test.go
+index 0277f51..225ae71 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,61 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestRemoveOrgUser(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"org admin", "eve", "/orgs/acme/users/ben", 204},
++		{"org admin self", "eve", "/orgs/acme/users/eve", 204},
++		{"manager not admin", "ann", "/orgs/acme/users/ben", 403},
++		{"anonymous", "", "/orgs/acme/users/ben", 401},
++		{"other org admin path", "eve", "/orgs/globex/users/gus", 404},
++		{"other org user", "eve", "/orgs/acme/users/gus", 404},
++		{"unknown user", "eve", "/orgs/acme/users/zed", 404},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveOrgUserEffects(t *testing.T) {
++	h := newServer()
++	if code, _ := do(t, h, "DELETE", "/orgs/acme/users/ben", "eve", ""); code != 204 {
++		t.Fatal(code)
++	}
++	// ben lost access to every project, including the archived one.
++	for _, p := range []string{"web", "legacy"} {
++		if code, _ := do(t, h, "GET", "/projects/"+p+"/tasks", "ben", ""); code != 404 {
++			t.Fatalf("%s: ben still readable: %d", p, code)
++		}
++	}
++	// Tasks assigned to ben are unassigned; the rest are untouched.
++	for tid, want := range map[string]string{"t1": "", "t2": "cat"} {
++		_, body := do(t, h, "GET", "/projects/web/tasks/"+tid, "ann", "")
++		var task Task
++		json.Unmarshal([]byte(body), &task)
++		if task.Assignee != want {
++			t.Fatalf("%s assignee %q want %q", tid, task.Assignee, want)
++		}
++	}
++	_, body := do(t, h, "GET", "/projects/legacy/tasks/t5", "ann", "")
++	var task Task
++	json.Unmarshal([]byte(body), &task)
++	if task.Assignee != "" {
++		t.Fatalf("t5 assignee %q", task.Assignee)
++	}
++	// Other users keep their access.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "cat", ""); code != 200 {
++		t.Fatal(code)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

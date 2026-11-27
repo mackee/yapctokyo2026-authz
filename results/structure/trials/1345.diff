@@ -1,0 +1,254 @@
+diff --git a/README.md b/README.md
+index 49b55af..7ed0510 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| DELETE | `/orgs/{oid}/users/{uid}` | offboarding → 204 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -34,6 +35,9 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Offboarding (`DELETE /orgs/{oid}/users/{uid}`): only org admins of that org. Another org → 404, non-admin → 403,
++  target missing or not in the org → 404. The user is removed from all projects of the org (archived included) and
++  their tasks there become unassigned.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index 647c0d2..6d65e74 100644
+--- a/main.go
++++ b/main.go
+@@ -25,6 +25,8 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - removing a user from an org (offboarding): org admins of that org only
++//     (other org -> 404, non-admin -> 403, target not in the org -> 404)
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -49,6 +51,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("DELETE /orgs/{oid}/users/{uid}", s.removeOrgUser)
+ 	return mux
+ }
+ 
+diff --git a/main_test.go b/main_test.go
+index 5c16a74..ebe446c 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -44,6 +44,64 @@ func TestRead(t *testing.T) {
+ 	}
+ }
+ 
++func TestRemoveOrgUser(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"admin removes", "eve", "/orgs/acme/users/ben", 204},
++		{"user without memberships", "eve", "/orgs/acme/users/hal", 204},
++		{"non admin", "ann", "/orgs/acme/users/ben", 403},
++		{"other org hidden", "eve", "/orgs/globex/users/gus", 404},
++		{"target in other org", "eve", "/orgs/acme/users/gus", 404},
++		{"unknown target", "eve", "/orgs/acme/users/zed", 404},
++		{"anonymous", "", "/orgs/acme/users/ben", 401},
++		{"unknown caller", "zed", "/orgs/acme/users/ben", 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveOrgUserEffects(t *testing.T) {
++	h := newServer()
++	if code, _ := do(t, h, "DELETE", "/orgs/acme/users/ben", "eve", ""); code != 204 {
++		t.Fatal(code)
++	}
++	// ben lost access to every project, archived ones included.
++	for _, p := range []string{"web", "legacy"} {
++		if code, _ := do(t, h, "GET", "/projects/"+p+"/tasks", "ben", ""); code != 404 {
++			t.Fatalf("%s: got %d want 404", p, code)
++		}
++	}
++	// His tasks are unassigned; others are untouched.
++	for id, want := range map[string]string{"t1": "", "t5": "", "t2": "cat"} {
++		p := "web"
++		if id == "t5" {
++			p = "legacy"
++		}
++		_, body := do(t, h, "GET", "/projects/"+p+"/tasks/"+id, "eve", "")
++		var task Task
++		json.Unmarshal([]byte(body), &task)
++		if task.Assignee != want {
++			t.Fatalf("%s assignee %q want %q", id, task.Assignee, want)
++		}
++	}
++	// Other members keep their roles.
++	if code, _ := do(t, h, "PATCH", "/projects/web/tasks/t2", "cat", `{"status":"done"}`); code != 200 {
++		t.Fatalf("cat lost access: %d", code)
++	}
++	// The globex organization is unaffected.
++	if code, _ := do(t, h, "GET", "/projects/gx/tasks/t6", "gus", ""); code != 200 {
++		t.Fatalf("gus: %d", code)
++	}
++}
++
+ func TestListOnlyProjectTasks(t *testing.T) {
+ 	code, body := do(t, newServer(), "GET", "/projects/web/tasks", "ann", "")
+ 	if code != 200 {
+diff --git a/offboard.go b/offboard.go
+new file mode 100644
+index 0000000..0b699f9
+--- /dev/null
++++ b/offboard.go
+@@ -0,0 +1,60 @@
++package main
++
++import "net/http"
++
++// removeOrgUser handles DELETE /orgs/{oid}/users/{uid}: offboarding.
++// It removes the user from every project of the organization (archived ones
++// included) and unassigns their tasks there, so that no task keeps an assignee
++// who is no longer a contributor or manager. Mirrors removeUserOutcome in
++// spec/taskboard.qnt.
++func (s *server) removeOrgUser(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	caller, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if caller == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	orgID := r.PathValue("oid")
++	if caller.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if !caller.OrgAdmin {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	target, err := findUser(ctx, s.db, r.PathValue("uid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if target == nil || target.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE user_id = ? AND project_id IN (SELECT id FROM projects WHERE org_id = ?)`,
++		target.ID, orgID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET assignee = '' WHERE assignee = ? AND project_id IN (SELECT id FROM projects WHERE org_id = ?)`,
++		target.ID, orgID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	w.WriteHeader(204)
++}
+diff --git a/spec/taskboard.qnt b/spec/taskboard.qnt
+index fe78764..5b2ddd3 100644
+--- a/spec/taskboard.qnt
++++ b/spec/taskboard.qnt
+@@ -123,6 +123,18 @@ module taskboard {
+     else if (projects.get(p).archived) 409
+     else 204
+ 
++  // DELETE /orgs/{oid}/users/{uid}: offboarding. Only an org admin of that
++  // organization may do it. An organization of another org is hidden (404);
++  // a target that is not a user of that organization is 404. The target is removed
++  // from every project of the organization (archived ones included) and the
++  // tasks assigned to them become unassigned.
++  def removeUserOutcome(u: UserId, o: str, target: UserId): int =
++    if (not(userExists(u))) 401
++    else if (users.get(u).org != o) 404
++    else if (not(users.get(u).orgAdmin)) 403
++    else if (not(userExists(target)) or users.get(target).org != o) 404
++    else 204
++
+   // ---- actions -------------------------------------------------------------
+ 
+   action unchanged = all {
+@@ -164,6 +176,16 @@ module taskboard {
+       members' = members,
+     } else unchanged
+ 
++  action removeUser(u: UserId, o: str, target: UserId): bool =
++    if (removeUserOutcome(u, o, target) == 204) all {
++      members' = members.keys().filter(k => k._2 != target).mapBy(k => members.get(k)),
++      tasks' = tasks.keys().mapBy(k =>
++        if (tasks.get(k).assignee == target) { ...tasks.get(k), assignee: "" } else tasks.get(k)),
++      nextTask' = nextTask,
++      users' = users,
++      projects' = projects,
++    } else unchanged
++
+   // ---- seed data and steps -------------------------------------------------
+ 
+   action init = all {
+@@ -202,7 +224,9 @@ module taskboard {
+     nondet t = 1.to(nextTask).oneOf()
+     nondet s = STATUSES.oneOf()
+     nondet changeAssignee = Set(true, false).oneOf()
++    nondet o = Set("acme", "globex", "missing").oneOf()
+     any {
++      removeUser(u, o, a),
+       createTask(u, p, a),
+       updateTask(u, p, t, s, changeAssignee, a),
+       deleteTask(u, p, t),
+@@ -230,6 +254,25 @@ module taskboard {
+       assert(deleteOutcome("ann", "web", 1) == 204),
+       assert(deleteOutcome("ben", "web", 1) == 403),
+       assert(deleteOutcome("ann", "web", 4) == 404),
++      assert(removeUserOutcome("eve", "acme", "ben") == 204),
++      assert(removeUserOutcome("ann", "acme", "ben") == 403),
++      assert(removeUserOutcome("eve", "globex", "gus") == 404),
++      assert(removeUserOutcome("eve", "acme", "gus") == 404),
++      assert(removeUserOutcome("eve", "acme", "nobody") == 404),
++      assert(removeUserOutcome("nobody", "acme", "ben") == 401),
++      unchanged,
++    })
++
++  // Removing ben unassigns his tasks and drops his memberships.
++  run removeUserTest =
++    init.then(removeUser("eve", "acme", "ben")).then(all {
++      assert(roleOf("web", "ben") == ""),
++      assert(roleOf("legacy", "ben") == ""),
++      assert(roleOf("web", "cat") == "contributor"),
++      assert(tasks.get(1).assignee == ""),
++      assert(tasks.get(5).assignee == ""),
++      assert(tasks.get(2).assignee == "cat"),
++      assert(invariants),
+       unchanged,
+     })
+ }

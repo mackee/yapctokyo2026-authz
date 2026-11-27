@@ -1,0 +1,277 @@
+diff --git a/README.md b/README.md
+index 8d54490..8925758 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members/{uid}/handover` | `{"to"}` → 200 with the moved tasks (`[]` if none) |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -30,6 +31,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Handover (`/members/{uid}/handover`) reassigns every task in the project held by `{uid}` to `to`. Only managers may hand over (contributors and org admins → 403). `to` must be a contributor or manager of the project, else 400. It is all-or-nothing and touches only this project.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/internal/capability/capability.go b/internal/capability/capability.go
+index ab5f720..ace0f92 100644
+--- a/internal/capability/capability.go
++++ b/internal/capability/capability.go
+@@ -19,6 +19,7 @@ package capability
+ 
+ import (
+ 	"errors"
++	"sort"
+ )
+ 
+ // Project roles.
+@@ -120,6 +121,7 @@ type ProjectScope interface {
+ 	Actor() ActorScope
+ 	Read() (ReadProject, error)
+ 	Write() (WriteProject, error)
++	Manage() (ManageProject, error)
+ 	Task(taskID string) TaskScope
+ }
+ 
+@@ -200,6 +202,30 @@ func (s *projectScope) Write() (WriteProject, error) {
+ 	return &writeProject{readProject: readProject{ps: s}, role: role}, nil
+ }
+ 
++// Manage applies the manager rule: readable, manager (else 403; org admins
++// without a project role are 403 too), not archived (else 409).
++func (s *projectScope) Manage() (ManageProject, error) {
++	var role string
++	err := s.as.a.st.read(func(st *state) error {
++		p, r, err := readable(st, s.as.actor, s.pid)
++		if err != nil {
++			return err
++		}
++		if r != RoleManager {
++			return deny(ErrForbidden, "forbidden")
++		}
++		if p.archived {
++			return deny(ErrArchived, "project is archived")
++		}
++		role = r
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return &manageProject{writeProject{readProject: readProject{ps: s}, role: role}}, nil
++}
++
+ // ---- project capabilities ----------------------------------------------------
+ 
+ // ReadProject may list and read the tasks of one project.
+@@ -219,6 +245,17 @@ type WriteProject interface {
+ 	CreateTask(title string, assignee Assignee) (TaskView, error)
+ }
+ 
++// ManageProject is the manager-only capability for one project. It may reassign
++// the tasks of one member to another member.
++type ManageProject interface {
++	WriteProject
++	// Handover reassigns every task of this project currently assigned to
++	// fromUser to toUser, atomically, and returns the moved tasks by ID. toUser
++	// must be a contributor or manager of the project (else 400). A fromUser
++	// with no tasks gets an empty result.
++	Handover(fromUser, toUser string) ([]TaskView, error)
++}
++
+ type readProject struct{ ps *projectScope }
+ 
+ func (p *readProject) ID() string { return p.ps.pid }
+@@ -275,6 +312,39 @@ func (p *writeProject) CreateTask(title string, assignee Assignee) (TaskView, er
+ 	return v, err
+ }
+ 
++type manageProject struct {
++	writeProject
++}
++
++func (p *manageProject) Handover(fromUser, toUser string) ([]TaskView, error) {
++	if toUser == "" {
++		return nil, deny(ErrInvalid, "to is required")
++	}
++	out := []TaskView{}
++	err := p.ps.as.a.st.tx(func(s *state) error {
++		a, err := admit(s, p.ps.pid, toUser)
++		if err != nil {
++			return err
++		}
++		out = []TaskView{}
++		for id, t := range s.tasks {
++			// An empty fromUser must never match unassigned tasks.
++			if t.project != p.ps.pid || fromUser == "" || t.assignee.user != fromUser {
++				continue
++			}
++			t.assignee = a
++			s.tasks[id] = t
++			out = append(out, t.view())
++		}
++		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return out, nil
++}
++
+ // ---- task capabilities ---------------------------------------------------------
+ 
+ // ReadTask may read one task.
+diff --git a/main.go b/main.go
+index 29de540..0bd0cb2 100644
+--- a/main.go
++++ b/main.go
+@@ -71,6 +71,7 @@ func newServer() http.Handler {
+ 	tanukirpc.RouteWithTransformer(r, projectTransformer(authz), "/projects/{pid}", func(pr *tanukirpc.Router[*projectRegistry]) {
+ 		pr.Get("/tasks", tanukirpc.NewHandler(listTasks))
+ 		pr.Post("/tasks", tanukirpc.NewHandler(createTask))
++		pr.Post("/members/{uid}/handover", tanukirpc.NewHandler(handoverTasks))
+ 
+ 		tanukirpc.RouteWithTransformer(pr, taskTransformer(), "/tasks/{tid}", func(tr *tanukirpc.Router[*taskRegistry]) {
+ 			tr.Get("/", tanukirpc.NewHandler(getTask))
+@@ -134,6 +135,24 @@ func createTask(ctx tanukirpc.Context[*projectRegistry], _ struct{}) (*Task, err
+ 	return writeJSON(ctx.Response(), http.StatusCreated, t)
+ }
+ 
++type handoverRequest struct {
++	To string `json:"to"`
++}
++
++// handoverTasks moves every task of {uid} in the project to the user named in
++// the body's "to". The response is the moved tasks (200, possibly empty).
++func handoverTasks(ctx tanukirpc.Context[*projectRegistry], _ struct{}) ([]Task, error) {
++	p, err := ctx.Registry().scope.Manage()
++	if err != nil {
++		return nil, err
++	}
++	var req handoverRequest
++	if err := decodeBody(ctx.Request(), &req); err != nil || req.To == "" {
++		return nil, errInvalidBody
++	}
++	return p.Handover(chi.URLParam(ctx.Request(), "uid"), req.To)
++}
++
+ func getTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*Task, error) {
+ 	t, err := ctx.Registry().scope.Read()
+ 	if err != nil {
+diff --git a/main_test.go b/main_test.go
+index 0277f51..65431ec 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,106 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestHandover(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager", "ann", "/projects/web/members/ben/handover", `{"to":"cat"}`, 200},
++		{"contributor", "ben", "/projects/web/members/cat/handover", `{"to":"ben"}`, 403},
++		{"viewer", "dan", "/projects/web/members/ben/handover", `{"to":"cat"}`, 403},
++		{"org admin", "eve", "/projects/web/members/ben/handover", `{"to":"cat"}`, 403},
++		{"non member", "hal", "/projects/web/members/ben/handover", `{"to":"cat"}`, 404},
++		{"other org", "gus", "/projects/web/members/ben/handover", `{"to":"cat"}`, 404},
++		{"anonymous", "", "/projects/web/members/ben/handover", `{"to":"cat"}`, 401},
++		{"archived", "ann", "/projects/legacy/members/ben/handover", `{"to":"ann"}`, 409},
++		{"to viewer", "ann", "/projects/web/members/ben/handover", `{"to":"dan"}`, 400},
++		{"to non member", "ann", "/projects/web/members/ben/handover", `{"to":"hal"}`, 400},
++		{"to other org", "ann", "/projects/web/members/ben/handover", `{"to":"gus"}`, 400},
++		{"to unknown", "ann", "/projects/web/members/ben/handover", `{"to":"zed"}`, 400},
++		{"to empty", "ann", "/projects/web/members/ben/handover", `{"to":""}`, 400},
++		{"no body", "ann", "/projects/web/members/ben/handover", ``, 400},
++		{"no tasks", "ann", "/projects/web/members/dan/handover", `{"to":"cat"}`, 200},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestHandoverMovesTasks(t *testing.T) {
++	srv := newServer()
++
++	// Give cat a second task in web, plus keep the existing unassigned t3 and
++	// cat's ops task t4 as bystanders.
++	if code, _ := do(t, srv, "POST", "/projects/web/tasks", "ann", `{"title":"extra","assignee":"cat"}`); code != 201 {
++		t.Fatalf("setup create: %d", code)
++	}
++
++	code, body := do(t, srv, "POST", "/projects/web/members/cat/handover", "ann", `{"to":"ben"}`)
++	if code != 200 {
++		t.Fatalf("handover: %d %s", code, body)
++	}
++	var moved []Task
++	if err := json.Unmarshal([]byte(body), &moved); err != nil {
++		t.Fatal(err)
++	}
++	if len(moved) != 2 || moved[0].ID != "t2" || moved[1].ID != "t7" {
++		t.Fatalf("moved = %+v, want t2 and t7", moved)
++	}
++	for _, task := range moved {
++		if task.Assignee != "ben" || task.ProjectID != "web" {
++			t.Fatalf("task %s not handed over: %+v", task.ID, task)
++		}
++	}
++
++	// The change is visible through the normal read path.
++	_, body = do(t, srv, "GET", "/projects/web/tasks", "ann", "")
++	var tasks []Task
++	json.Unmarshal([]byte(body), &tasks)
++	got := map[string]string{}
++	for _, task := range tasks {
++		got[task.ID] = task.Assignee
++	}
++	want := map[string]string{"t1": "ben", "t2": "ben", "t3": "", "t7": "ben"}
++	for id, assignee := range want {
++		if got[id] != assignee {
++			t.Fatalf("task %s assignee = %q, want %q", id, got[id], assignee)
++		}
++	}
++
++	// Other projects are untouched.
++	_, body = do(t, srv, "GET", "/projects/ops/tasks/t4", "ann", "")
++	var t4 Task
++	json.Unmarshal([]byte(body), &t4)
++	if t4.Assignee != "cat" {
++		t.Fatalf("ops task t4 assignee = %q, want cat", t4.Assignee)
++	}
++
++	// Nothing left to hand over: empty array, not null.
++	code, body = do(t, srv, "POST", "/projects/web/members/cat/handover", "ann", `{"to":"ben"}`)
++	if code != 200 || body != "[]\n" {
++		t.Fatalf("second handover: %d %q, want 200 []", code, body)
++	}
++}
++
++func TestHandoverRejectedLeavesDataUnchanged(t *testing.T) {
++	srv := newServer()
++	if code, _ := do(t, srv, "POST", "/projects/web/members/ben/handover", "ann", `{"to":"dan"}`); code != 400 {
++		t.Fatalf("got %d want 400", code)
++	}
++	_, body := do(t, srv, "GET", "/projects/web/tasks/t1", "ann", "")
++	var t1 Task
++	json.Unmarshal([]byte(body), &t1)
++	if t1.Assignee != "ben" {
++		t.Fatalf("t1 assignee = %q after rejected handover, want ben", t1.Assignee)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

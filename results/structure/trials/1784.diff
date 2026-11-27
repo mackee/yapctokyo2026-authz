@@ -1,0 +1,201 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..539fd27 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| DELETE | `/orgs/{orgID}/users/{uid}` | offboarding: removes the user from every project of the org → 204 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -34,6 +35,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- `DELETE /orgs/{orgID}/users/{uid}` is for offboarding. Only org admins of the org may call it (other org → 404, non-admin member → 403). It removes the user's memberships in all projects of the org, including archived ones, and unassigns the tasks the user held there. The user row and the org admin flag are not changed. A target that is not a user of the org → 404.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index a75fde4..a4ee59b 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("DELETE /orgs/{orgID}/users/{uid}", s.removeUserFromOrg)
+ 	return &appHandler{Handler: mux, db: db}
+ }
+ 
+diff --git a/org.go b/org.go
+new file mode 100644
+index 0000000..db9b279
+--- /dev/null
++++ b/org.go
+@@ -0,0 +1,68 @@
++package main
++
++import (
++	"net/http"
++)
++
++// removeUserFromOrg is the offboarding step: it removes uid from every project
++// of the org, archived projects included, and unassigns the tasks uid held in
++// those projects so that the "assignee is a member" model rule keeps holding.
++//
++// Only org admins of the org may call it. A caller from another org, or a
++// target that is not a user of the org, gets 404 (the org is invisible to them).
++func (s *server) removeUserFromOrg(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	orgID := r.PathValue("orgID")
++	targetID := r.PathValue("uid")
++
++	caller, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if caller == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	if caller.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if !caller.OrgAdmin {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	target, err := findUser(ctx, s.db, targetID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if target == nil || target.OrgID != orgID {
++		writeError(w, 404, "not found")
++		return
++	}
++
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	if _, err := tx.ExecContext(ctx,
++		`UPDATE tasks SET assignee = '' WHERE assignee = ? AND project_id IN (SELECT id FROM projects WHERE org_id = ?)`,
++		targetID, orgID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx,
++		`DELETE FROM memberships WHERE user_id = ? AND project_id IN (SELECT id FROM projects WHERE org_id = ?)`,
++		targetID, orgID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	w.WriteHeader(204)
++}
+diff --git a/org_test.go b/org_test.go
+new file mode 100644
+index 0000000..bcf259a
+--- /dev/null
++++ b/org_test.go
+@@ -0,0 +1,89 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++// DELETE /orgs/{orgID}/users/{uid} is the offboarding step: it removes the user
++// from every project of the org (archived ones included) and returns 204.
++// Only org admins of the org may call it.
++
++func TestRemoveUserFromOrgAccess(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"org admin removes member", "eve", "/orgs/acme/users/ben", 204},
++		{"org admin, user with no memberships", "eve", "/orgs/acme/users/hal", 204},
++		{"manager caller is not an org admin", "ann", "/orgs/acme/users/ben", 403},
++		{"viewer caller", "dan", "/orgs/acme/users/ben", 403},
++		{"caller from another org", "gus", "/orgs/acme/users/ben", 404},
++		{"org that is not the caller's", "eve", "/orgs/globex/users/gus", 404},
++		{"user not in the org", "eve", "/orgs/acme/users/gus", 404},
++		{"unknown user", "eve", "/orgs/acme/users/zed", 404},
++		{"anonymous", "", "/orgs/acme/users/ben", 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveUserFromOrgRemovesEveryMembership(t *testing.T) {
++	s := newServer()
++	if code, body := do(t, s, "DELETE", "/orgs/acme/users/ben", "eve", ""); code != 204 {
++		t.Fatalf("got %d want 204: %s", code, body)
++	}
++
++	// ben is no longer a member of any acme project, archived legacy included.
++	for _, path := range []string{"/projects/web/tasks", "/projects/legacy/tasks"} {
++		if code, _ := do(t, s, "GET", path, "ben", ""); code != 404 {
++			t.Fatalf("ben reading %s: got %d want 404", path, code)
++		}
++	}
++	var n int
++	if err := s.(*appHandler).db.QueryRow(`SELECT COUNT(*) FROM memberships WHERE user_id = 'ben'`).Scan(&n); err != nil {
++		t.Fatal(err)
++	}
++	if n != 0 {
++		t.Fatalf("ben still has %d memberships", n)
++	}
++
++	// Tasks ben held are unassigned in their projects (web t1, legacy t5).
++	for _, path := range []string{"/projects/web/tasks/t1", "/projects/legacy/tasks/t5"} {
++		_, body := do(t, s, "GET", path, "ann", "")
++		var task Task
++		if err := json.Unmarshal([]byte(body), &task); err != nil {
++			t.Fatal(err)
++		}
++		if task.Assignee != "" {
++			t.Fatalf("%s still assigned to %q", path, task.Assignee)
++		}
++	}
++}
++
++func TestRemoveUserFromOrgLeavesOthersAlone(t *testing.T) {
++	s := newServer()
++	if code, body := do(t, s, "DELETE", "/orgs/acme/users/ben", "eve", ""); code != 204 {
++		t.Fatalf("got %d want 204: %s", code, body)
++	}
++
++	// Other acme members keep their roles: cat is still a contributor of web
++	// (may update her own task t2) and ann still manages web (may reassign t1).
++	if code, body := do(t, s, "PATCH", "/projects/web/tasks/t2", "cat", `{"status":"done"}`); code != 200 {
++		t.Fatalf("cat: got %d want 200: %s", code, body)
++	}
++	if code, body := do(t, s, "PATCH", "/projects/web/tasks/t1", "ann", `{"assignee":"cat"}`); code != 200 {
++		t.Fatalf("ann: got %d want 200: %s", code, body)
++	}
++
++	// The globex project and its member are untouched.
++	if code, body := do(t, s, "GET", "/projects/gx/tasks/t6", "gus", ""); code != 200 {
++		t.Fatalf("gus: got %d want 200: %s", code, body)
++	}
++}

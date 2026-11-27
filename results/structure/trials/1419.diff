@@ -1,0 +1,376 @@
+diff --git a/README.md b/README.md
+index 5300749..c5873ab 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| DELETE | `/projects/{pid}/members/{uid}` | remove a member → 204 |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`. Request
+ bodies are JSON (`Content-Type: application/json`).
+@@ -35,6 +36,7 @@ bodies are JSON (`Content-Type: application/json`).
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Only managers may remove members. A user who is not a member of the project → 404 (before the role check). Removing a member unassigns their tasks in that project.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/internal/model/aggregate.go b/internal/model/aggregate.go
+index e558654..44d731c 100644
+--- a/internal/model/aggregate.go
++++ b/internal/model/aggregate.go
+@@ -126,6 +126,39 @@ func (a *updateTaskAggregate) apply(ctx context.Context, tx DB) (*Task, error) {
+ 	return t, nil
+ }
+ 
++// removeMemberAggregate removes one membership. The tasks of the project that
++// are assigned to the member are unassigned, so that an assignee stays a
++// contributor or manager of the task's project.
++type removeMemberAggregate struct {
++	membership *Membership
++	assigned   []*Task // membership.AssignedTasks
++}
++
++func loadRemoveMember(ctx context.Context, tx DB, projectID, userID string) (*removeMemberAggregate, error) {
++	m, err := NewMembershipTable().Find(ctx, tx, projectID, userID)
++	if errors.Is(err, ErrNoRows) {
++		return nil, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return nil, err
++	}
++	tasks, err := m.AssignedTasks(ctx, tx)
++	if err != nil {
++		return nil, err
++	}
++	return &removeMemberAggregate{membership: m, assigned: tasks}, nil
++}
++
++func (a *removeMemberAggregate) validate() error { return nil }
++
++func (a *removeMemberAggregate) apply(ctx context.Context, tx DB) error {
++	for _, t := range a.assigned {
++		if err := t.unassign(ctx, tx); err != nil {
++			return err
++		}
++	}
++	return a.membership.destroy(ctx, tx)
++}
++
+ // deleteTaskAggregate removes one task.
+ type deleteTaskAggregate struct {
+ 	task *Task
+diff --git a/internal/model/authz.go b/internal/model/authz.go
+index 89224a1..3d9f9db 100644
+--- a/internal/model/authz.go
++++ b/internal/model/authz.go
+@@ -121,8 +121,51 @@ func (a TaskAuthz) CanManage() error {
+ 	return nil
+ }
+ 
++// MemberAuthz is what the actor may do with one membership of one project.
++type MemberAuthz struct {
++	project ProjectAuthz
++	member  string
++}
++
++// Project returns the project-level authorization the member object came from.
++func (a MemberAuthz) Project() ProjectAuthz { return a.project }
++
++// UserID returns the member the object is bound to.
++func (a MemberAuthz) UserID() string { return a.member }
++
++// CanRead reports whether the actor may read the membership. NewMemberAuthz
++// only returns objects that can read, so this is true for every built object.
++func (a MemberAuthz) CanRead() bool { return a.member != "" && a.project.CanRead() }
++
++// CanRemove returns nil if the actor may remove the member: managers only
++// (else ErrForbidden) and not archived (else ErrArchived).
++func (a MemberAuthz) CanRemove() error {
++	if !a.CanRead() || a.project.role != RoleManager {
++		return deny(ErrForbidden, "forbidden")
++	}
++	if a.project.archived {
++		return deny(ErrArchived, "project is archived")
++	}
++	return nil
++}
++
+ // ---- building authorization objects -------------------------------------------------
+ 
++// NewMemberAuthz builds the actor's authorization object for one member of the
++// project. The user must be a member of the project; otherwise ErrNotFound.
++func NewMemberAuthz(ctx context.Context, db DB, pa ProjectAuthz, userID string) (MemberAuthz, error) {
++	if !pa.CanRead() {
++		return MemberAuthz{}, deny(ErrNotFound, "not found")
++	}
++	m, err := NewMembershipTable().Find(ctx, db, pa.project, userID)
++	if errors.Is(err, ErrNoRows) {
++		return MemberAuthz{}, deny(ErrNotFound, "not found")
++	} else if err != nil {
++		return MemberAuthz{}, err
++	}
++	return MemberAuthz{project: pa, member: m.UserID}, nil
++}
++
+ // Authenticate resolves the X-User value. Unknown or missing users are 401.
+ func Authenticate(ctx context.Context, db DB, userID string) (Actor, error) {
+ 	if userID == "" {
+diff --git a/internal/model/member_table.go b/internal/model/member_table.go
+new file mode 100644
+index 0000000..41905ab
+--- /dev/null
++++ b/internal/model/member_table.go
+@@ -0,0 +1,20 @@
++package model
++
++import "context"
++
++// Remove removes the member from the project and unassigns their tasks there.
++func (*MembershipTable) Remove(ctx context.Context, db DB, authz MemberAuthz) error {
++	if err := authz.CanRemove(); err != nil {
++		return err
++	}
++	return inTx(ctx, db, func(tx DB) error {
++		agg, err := loadRemoveMember(ctx, tx, authz.Project().ProjectID(), authz.UserID())
++		if err != nil {
++			return err
++		}
++		if err := agg.validate(); err != nil {
++			return err
++		}
++		return agg.apply(ctx, tx)
++	})
++}
+diff --git a/internal/model/record.go b/internal/model/record.go
+index b23b291..42d1109 100644
+--- a/internal/model/record.go
++++ b/internal/model/record.go
+@@ -161,6 +161,15 @@ func (r *Task) destroy(ctx context.Context, db DB) error {
+ 	return nil
+ }
+ 
++// destroy removes the membership.
++func (r *Membership) destroy(ctx context.Context, db DB) error {
++	if _, err := db.ExecContext(ctx,
++		`DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, r.ProjectID, r.UserID); err != nil {
++		return err
++	}
++	return nil
++}
++
+ func (r *Task) save(ctx context.Context, db DB) error {
+ 	if _, err := db.ExecContext(ctx,
+ 		`UPDATE tasks SET project_id = ?, title = ?, status = ?, assignee = ? WHERE id = ?`,
+diff --git a/main.go b/main.go
+index 5bcd29e..f8941f3 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,12 @@ type taskRegistry struct {
+ 	authz model.TaskAuthz
+ }
+ 
++// memberRegistry is the whole handler-visible surface under /projects/{pid}/members/{uid}.
++type memberRegistry struct {
++	db    model.DB
++	authz model.MemberAuthz
++}
++
+ func init() {
+ 	// tanukirpc logs every request through the default slog logger; keep the
+ 	// demo and test output quiet.
+@@ -83,6 +89,10 @@ func newServer() http.Handler {
+ 			tr.Patch("/", tanukirpc.NewHandler(updateTask))
+ 			tr.Delete("/", tanukirpc.NewHandler(deleteTask))
+ 		})
++
++		tanukirpc.RouteWithTransformer(pr, memberTransformer(), "/members/{uid}", func(mr *tanukirpc.Router[*memberRegistry]) {
++			mr.Delete("/", tanukirpc.NewHandler(removeMember))
++		})
+ 	})
+ 	return r
+ }
+@@ -116,6 +126,19 @@ func taskTransformer() tanukirpc.Transformer[*projectRegistry, *taskRegistry] {
+ 	})
+ }
+ 
++// memberTransformer builds the actor's authorization object for {uid}. A user
++// who is not a member of the project stops here (404).
++func memberTransformer() tanukirpc.Transformer[*projectRegistry, *memberRegistry] {
++	return tanukirpc.NewTransformer(func(ctx tanukirpc.Context[*projectRegistry]) (*memberRegistry, error) {
++		reg := ctx.Registry()
++		authz, err := model.NewMemberAuthz(ctx, reg.db, reg.authz, chi.URLParam(ctx.Request(), "uid"))
++		if err != nil {
++			return nil, err
++		}
++		return &memberRegistry{db: reg.db, authz: authz}, nil
++	})
++}
++
+ // ---- handlers -------------------------------------------------------------------
+ //
+ // tanukirpc decodes and validates the request body before the handler runs, so
+@@ -163,6 +186,15 @@ func deleteTask(ctx tanukirpc.Context[*taskRegistry], _ struct{}) (*struct{}, er
+ 	return nil, nil
+ }
+ 
++func removeMember(ctx tanukirpc.Context[*memberRegistry], _ struct{}) (*struct{}, error) {
++	reg := ctx.Registry()
++	if err := model.NewMembershipTable().Remove(ctx, reg.db, reg.authz); err != nil {
++		return nil, err
++	}
++	ctx.Response().WriteHeader(http.StatusNoContent)
++	return nil, nil
++}
++
+ // ---- HTTP plumbing ------------------------------------------------------------------
+ 
+ // jsonResponseCodec encodes responses as JSON even when the request has no
+diff --git a/main_test.go b/main_test.go
+index a54b0a8..80e758c 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -135,3 +135,66 @@ func TestDelete(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestRemoveMember(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"manager", "ann", "/projects/web/members/ben", 204},
++		{"manager removes manager", "ann", "/projects/web/members/ivy", 204},
++		{"contributor", "ben", "/projects/web/members/cat", 403},
++		{"viewer", "dan", "/projects/web/members/cat", 403},
++		{"org admin", "eve", "/projects/web/members/ben", 403},
++		{"not a member", "ann", "/projects/web/members/hal", 404},
++		{"unknown user id", "ann", "/projects/web/members/zed", 404},
++		{"non member actor", "hal", "/projects/web/members/ben", 404},
++		{"other org", "gus", "/projects/web/members/ben", 404},
++		{"missing project", "ann", "/projects/nope/members/ben", 404},
++		{"archived", "ann", "/projects/legacy/members/ben", 409},
++		{"anonymous", "", "/projects/web/members/ben", 401},
++		{"unknown actor", "zed", "/projects/web/members/ben", 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "DELETE", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRemoveMemberEffects(t *testing.T) {
++	h := newServer()
++	if code, _ := do(t, h, "DELETE", "/projects/web/members/ben", "ann", ""); code != 204 {
++		t.Fatalf("remove: got %d", code)
++	}
++	// ben lost access to web.
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("removed member read: got %d want 404", code)
++	}
++	// removing again is 404.
++	if code, _ := do(t, h, "DELETE", "/projects/web/members/ben", "ann", ""); code != 404 {
++		t.Fatalf("remove twice: got %d want 404", code)
++	}
++	// his task in web is unassigned; his membership elsewhere is untouched.
++	_, body := do(t, h, "GET", "/projects/web/tasks/t1", "ann", "")
++	var task struct{ Assignee string }
++	if err := json.Unmarshal([]byte(body), &task); err != nil {
++		t.Fatal(err)
++	}
++	if task.Assignee != "" {
++		t.Fatalf("t1 assignee = %q, want unassigned", task.Assignee)
++	}
++	if code, _ := do(t, h, "GET", "/projects/legacy/tasks/t5", "ben", ""); code != 200 {
++		t.Fatalf("legacy membership: got %d want 200", code)
++	}
++	_, body = do(t, h, "GET", "/projects/legacy/tasks/t5", "ann", "")
++	if err := json.Unmarshal([]byte(body), &task); err != nil {
++		t.Fatal(err)
++	}
++	if task.Assignee != "ben" {
++		t.Fatalf("t5 assignee = %q, want ben", task.Assignee)
++	}
++}
+diff --git a/spec/taskboard.qnt b/spec/taskboard.qnt
+index fe78764..7cb7ce1 100644
+--- a/spec/taskboard.qnt
++++ b/spec/taskboard.qnt
+@@ -123,6 +123,18 @@ module taskboard {
+     else if (projects.get(p).archived) 409
+     else 204
+ 
++  // DELETE /projects/{pid}/members/{uid}
++  // m is the user to remove. A user who is not a member of the project is a
++  // 404 (like a task outside the project), checked before the role rules.
++  // Only managers may remove members; archived projects reject it.
++  def removeMemberOutcome(u: UserId, p: ProjectId, m: UserId): int =
++    if (not(userExists(u))) 401
++    else if (not(canRead(u, p))) 404
++    else if (roleOf(p, m) == "") 404
++    else if (roleOf(p, u) != "manager") 403
++    else if (projects.get(p).archived) 409
++    else 204
++
+   // ---- actions -------------------------------------------------------------
+ 
+   action unchanged = all {
+@@ -164,6 +176,20 @@ module taskboard {
+       members' = members,
+     } else unchanged
+ 
++  // Removing a member also unassigns the tasks of that project assigned to
++  // them, so that inv_assigneeIsWriter keeps holding.
++  action removeMember(u: UserId, p: ProjectId, m: UserId): bool =
++    if (removeMemberOutcome(u, p, m) == 204) all {
++      members' = members.keys().exclude(Set((p, m))).mapBy(k => members.get(k)),
++      tasks' = tasks.keys().mapBy(t =>
++        if (tasks.get(t).project == p and tasks.get(t).assignee == m)
++          { ...tasks.get(t), assignee: "" }
++        else tasks.get(t)),
++      nextTask' = nextTask,
++      users' = users,
++      projects' = projects,
++    } else unchanged
++
+   // ---- seed data and steps -------------------------------------------------
+ 
+   action init = all {
+@@ -206,6 +232,7 @@ module taskboard {
+       createTask(u, p, a),
+       updateTask(u, p, t, s, changeAssignee, a),
+       deleteTask(u, p, t),
++      removeMember(u, p, a),
+     }
+   }
+ 
+@@ -230,6 +257,22 @@ module taskboard {
+       assert(deleteOutcome("ann", "web", 1) == 204),
+       assert(deleteOutcome("ben", "web", 1) == 403),
+       assert(deleteOutcome("ann", "web", 4) == 404),
++      assert(removeMemberOutcome("ann", "web", "ben") == 204),
++      assert(removeMemberOutcome("ben", "web", "cat") == 403),
++      assert(removeMemberOutcome("ann", "web", "hal") == 404),
++      assert(removeMemberOutcome("ann", "legacy", "ben") == 409),
++      assert(removeMemberOutcome("eve", "web", "ben") == 403),
++      assert(removeMemberOutcome("hal", "web", "ben") == 404),
++      assert(removeMemberOutcome("nobody", "web", "ben") == 401),
++      unchanged,
++    })
++
++  // Removing ben from web unassigns his task there.
++  run removeMemberTest =
++    init.then(removeMember("ann", "web", "ben")).then(all {
++      assert(roleOf("web", "ben") == ""),
++      assert(tasks.get(1).assignee == ""),
++      assert(tasks.get(5).assignee == "ben"),
+       unchanged,
+     })
+ }

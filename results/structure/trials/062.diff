@@ -1,0 +1,436 @@
+diff --git a/README.md b/README.md
+index ba637dd..281f765 100644
+--- a/README.md
++++ b/README.md
+@@ -19,8 +19,11 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/access-requests` | request to join → 201 `{"id","projectId","userId","status":"pending"}` |
++| GET | `/projects/{pid}/access-requests` | list the project's requests (managers only) |
++| POST | `/projects/{pid}/access-requests/{rid}/approve` | approve → 200; requester becomes a contributor |
+ 
+-Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
++Statuses: `open`, `doing`, `done`. Access request statuses: `pending`, `approved`. Errors are `{"error":"..."}`.
+ 
+ ## Access rules
+ 
+@@ -32,6 +35,9 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Access requests: any user of the project's organization may request to join, even if they cannot read the project. Requesting is refused with 409 if the user is already a member, the project is archived, or a request is already pending.
++- Listing and approving requests requires the `manager` role: non-readable → 404, readable but not a manager → 403, archived → 409 on approve.
++- Approving a request makes the requester a `contributor` (unless they already have a role) and sets the request to `approved`. Approving a non-pending request → 409.
+ 
+ ## Seed data
+ 
+diff --git a/access.go b/access.go
+new file mode 100644
+index 0000000..afe4cea
+--- /dev/null
++++ b/access.go
+@@ -0,0 +1,108 @@
++package main
++
++import "net/http"
++
++// Project access requests.
++//
++//   - POST: any user of the project's organization may request to join,
++//     even without being able to read the project (that is the point).
++//     Already a member, archived project, or a pending request already
++//     exists -> 409.
++//   - GET: lists the project's requests. Only managers of the project may
++//     see them: non-readable -> 404, readable but not manager -> 403.
++//   - POST .../{rid}/approve: managers only. Adds the requester as a
++//     contributor and returns the updated request.
++
++func (s *server) requestAccess(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	user := s.store.User(r.Header.Get("X-User"))
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project := s.store.Project(r.PathValue("pid"))
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if s.store.Role(project.ID, user.ID) != "" {
++		writeError(w, 409, "already a member of the project")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	if s.store.PendingAccessRequest(project.ID, user.ID) != nil {
++		writeError(w, 409, "access request already pending")
++		return
++	}
++	req := s.store.AddAccessRequest(project.ID, user.ID)
++	writeJSON(w, 201, req)
++}
++
++// managerOf checks that the caller can manage the project in the path.
++// It writes the error response and returns false when access is refused.
++func (s *server) managerOf(w http.ResponseWriter, r *http.Request) (*Project, bool) {
++	user := s.store.User(r.Header.Get("X-User"))
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return nil, false
++	}
++	project := s.store.Project(r.PathValue("pid"))
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return nil, false
++	}
++	role := s.store.Role(project.ID, user.ID)
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return nil, false
++	}
++	if role != RoleManager {
++		writeError(w, 403, "forbidden")
++		return nil, false
++	}
++	return project, true
++}
++
++func (s *server) listAccessRequests(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	project, ok := s.managerOf(w, r)
++	if !ok {
++		return
++	}
++	writeJSON(w, 200, s.store.AccessRequestsInProject(project.ID))
++}
++
++func (s *server) approveAccessRequest(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	project, ok := s.managerOf(w, r)
++	if !ok {
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	req := s.store.AccessRequest(r.PathValue("rid"))
++	if req == nil || req.ProjectID != project.ID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if req.Status != RequestPending {
++		writeError(w, 409, "access request is not pending")
++		return
++	}
++	if s.store.Role(project.ID, req.UserID) == "" {
++		s.store.SetRole(project.ID, req.UserID, RoleContributor)
++	}
++	req.Status = RequestApproved
++	writeJSON(w, 200, req)
++}
+diff --git a/access_test.go b/access_test.go
+new file mode 100644
+index 0000000..bf20599
+--- /dev/null
++++ b/access_test.go
+@@ -0,0 +1,171 @@
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++	"strings"
++	"testing"
++)
++
++// newServerWithRequest returns a server where hal has a pending request (r1) for web.
++func newServerWithRequest(t *testing.T) http.Handler {
++	t.Helper()
++	h := newServer()
++	if code, body := do(t, h, "POST", "/projects/web/access-requests", "hal", ""); code != 201 {
++		t.Fatalf("setup: got %d: %s", code, body)
++	}
++	return h
++}
++
++func TestRequestAccess(t *testing.T) {
++	cases := []struct {
++		name, user, project string
++		want                int
++	}{
++		{"non member", "hal", "web", 201},
++		{"anonymous", "", "web", 401},
++		{"unknown user", "zed", "web", 401},
++		{"unknown project", "hal", "nope", 404},
++		{"other org", "gus", "web", 404},
++		{"already member", "dan", "web", 409},
++		{"archived", "hal", "legacy", 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", "/projects/"+c.project+"/access-requests", c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestRequestAccessBody(t *testing.T) {
++	code, body := do(t, newServer(), "POST", "/projects/web/access-requests", "hal", "")
++	if code != 201 {
++		t.Fatalf("got %d", code)
++	}
++	want := `{"id":"r1","projectId":"web","userId":"hal","status":"pending"}`
++	if got := strings.TrimSpace(body); got != want {
++		t.Fatalf("got %s want %s", got, want)
++	}
++}
++
++func TestRequestAccessDuplicatePending(t *testing.T) {
++	h := newServerWithRequest(t)
++	code, _ := do(t, h, "POST", "/projects/web/access-requests", "hal", "")
++	if code != 409 {
++		t.Fatalf("got %d want 409", code)
++	}
++}
++
++func TestListAccessRequests(t *testing.T) {
++	cases := []struct {
++		name, user string
++		want       int
++	}{
++		{"manager", "ann", 200},
++		{"other manager", "ivy", 200},
++		{"viewer", "dan", 403},
++		{"contributor", "ben", 403},
++		{"org admin without role", "eve", 403},
++		{"non member", "hal", 404},
++		{"other org", "gus", 404},
++		{"anonymous", "", 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServerWithRequest(t), "GET", "/projects/web/access-requests", c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestListAccessRequestsContents(t *testing.T) {
++	h := newServerWithRequest(t)
++	code, body := do(t, h, "GET", "/projects/web/access-requests", "ann", "")
++	if code != 200 {
++		t.Fatalf("got %d", code)
++	}
++	var reqs []AccessRequest
++	if err := json.Unmarshal([]byte(body), &reqs); err != nil {
++		t.Fatal(err)
++	}
++	if len(reqs) != 1 || reqs[0].ID != "r1" || reqs[0].UserID != "hal" || reqs[0].Status != "pending" {
++		t.Fatalf("unexpected list: %s", body)
++	}
++}
++
++func TestApproveAccessRequest(t *testing.T) {
++	cases := []struct {
++		name, user, path string
++		want             int
++	}{
++		{"manager", "ann", "/projects/web/access-requests/r1/approve", 200},
++		{"contributor", "ben", "/projects/web/access-requests/r1/approve", 403},
++		{"viewer", "dan", "/projects/web/access-requests/r1/approve", 403},
++		{"org admin without role", "eve", "/projects/web/access-requests/r1/approve", 403},
++		{"requester is not a member yet", "hal", "/projects/web/access-requests/r1/approve", 404},
++		{"other org", "gus", "/projects/web/access-requests/r1/approve", 404},
++		{"anonymous", "", "/projects/web/access-requests/r1/approve", 401},
++		{"unknown request", "ann", "/projects/web/access-requests/r9/approve", 404},
++		{"archived project", "ann", "/projects/legacy/access-requests/r1/approve", 409},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServerWithRequest(t), "POST", c.path, c.user, "")
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestApproveAccessRequestAddsContributor(t *testing.T) {
++	h := newServerWithRequest(t)
++
++	code, body := do(t, h, "POST", "/projects/web/access-requests/r1/approve", "ann", "")
++	if code != 200 {
++		t.Fatalf("approve: got %d: %s", code, body)
++	}
++	var req AccessRequest
++	if err := json.Unmarshal([]byte(body), &req); err != nil {
++		t.Fatal(err)
++	}
++	if req.Status != "approved" || req.ID != "r1" || req.UserID != "hal" {
++		t.Fatalf("unexpected approved request: %s", body)
++	}
++
++	// hal is now a contributor, so may create a task (and may not delete one).
++	code, body = do(t, h, "POST", "/projects/web/tasks", "hal", `{"title":"x","assignee":"hal"}`)
++	if code != 201 {
++		t.Fatalf("contributor create: got %d: %s", code, body)
++	}
++	code, _ = do(t, h, "DELETE", "/projects/web/tasks/t1", "hal", "")
++	if code != 403 {
++		t.Fatalf("contributor delete: got %d want 403", code)
++	}
++}
++
++func TestApproveAccessRequestTwice(t *testing.T) {
++	h := newServerWithRequest(t)
++	if code, _ := do(t, h, "POST", "/projects/web/access-requests/r1/approve", "ann", ""); code != 200 {
++		t.Fatalf("first approve: got %d", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/access-requests/r1/approve", "ann", ""); code != 409 {
++		t.Fatalf("second approve: got %d want 409", code)
++	}
++}
++
++func TestApproveRequestFromOtherProject(t *testing.T) {
++	h := newServerWithRequest(t)
++	if code, _ := do(t, h, "POST", "/projects/ops/access-requests", "hal", ""); code != 201 {
++		t.Fatalf("setup ops request: got %d", code)
++	}
++	// r2 belongs to ops; approving it through web must not work.
++	if code, _ := do(t, h, "POST", "/projects/web/access-requests/r2/approve", "ann", ""); code != 404 {
++		t.Fatalf("got %d want 404", code)
++	}
++}
+diff --git a/main.go b/main.go
+index 6152a73..8aa907f 100644
+--- a/main.go
++++ b/main.go
+@@ -20,6 +20,9 @@ import (
+ //   - contributors may only modify tasks assigned to themselves
+ //     and may not reassign tasks; managers may modify any task
+ //   - only managers may delete tasks
++//   - any org user may request access to a project (access.go); only
++//     managers may list or approve requests; approval makes the requester
++//     a contributor
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
+ 
+@@ -42,6 +45,9 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/access-requests", s.requestAccess)
++	mux.HandleFunc("GET /projects/{pid}/access-requests", s.listAccessRequests)
++	mux.HandleFunc("POST /projects/{pid}/access-requests/{rid}/approve", s.approveAccessRequest)
+ 	return mux
+ }
+ 
+diff --git a/store.go b/store.go
+index f468b2d..5c8c7eb 100644
+--- a/store.go
++++ b/store.go
+@@ -36,13 +36,28 @@ const (
+ 
+ var validStatuses = map[string]bool{"open": true, "doing": true, "done": true}
+ 
++// AccessRequest is a user's request to join a project.
++type AccessRequest struct {
++	ID        string `json:"id"`
++	ProjectID string `json:"projectId"`
++	UserID    string `json:"userId"`
++	Status    string `json:"status"`
++}
++
++const (
++	RequestPending  = "pending"
++	RequestApproved = "approved"
++)
++
+ type Store struct {
+-	mu       sync.Mutex
+-	users    map[string]*User
+-	projects map[string]*Project
+-	members  map[string]map[string]string // projectID -> userID -> role
+-	tasks    map[string]*Task             // task IDs are unique across all projects
+-	nextID   int
++	mu             sync.Mutex
++	users          map[string]*User
++	projects       map[string]*Project
++	members        map[string]map[string]string // projectID -> userID -> role
++	tasks          map[string]*Task             // task IDs are unique across all projects
++	nextID         int
++	accessRequests []*AccessRequest // in creation order
++	nextReqID      int
+ }
+ 
+ func (s *Store) User(id string) *User { return s.users[id] }
+@@ -73,6 +88,54 @@ func (s *Store) PutTask(t *Task) { s.tasks[t.ID] = t }
+ 
+ func (s *Store) DeleteTask(id string) { delete(s.tasks, id) }
+ 
++func (s *Store) SetRole(projectID, userID, role string) {
++	if s.members[projectID] == nil {
++		s.members[projectID] = map[string]string{}
++	}
++	s.members[projectID][userID] = role
++}
++
++func (s *Store) AddAccessRequest(projectID, userID string) *AccessRequest {
++	s.nextReqID++
++	r := &AccessRequest{
++		ID:        fmt.Sprintf("r%d", s.nextReqID),
++		ProjectID: projectID,
++		UserID:    userID,
++		Status:    RequestPending,
++	}
++	s.accessRequests = append(s.accessRequests, r)
++	return r
++}
++
++func (s *Store) AccessRequest(id string) *AccessRequest {
++	for _, r := range s.accessRequests {
++		if r.ID == id {
++			return r
++		}
++	}
++	return nil
++}
++
++// PendingAccessRequest returns the user's pending request for the project, or nil.
++func (s *Store) PendingAccessRequest(projectID, userID string) *AccessRequest {
++	for _, r := range s.accessRequests {
++		if r.ProjectID == projectID && r.UserID == userID && r.Status == RequestPending {
++			return r
++		}
++	}
++	return nil
++}
++
++func (s *Store) AccessRequestsInProject(projectID string) []*AccessRequest {
++	out := []*AccessRequest{}
++	for _, r := range s.accessRequests {
++		if r.ProjectID == projectID {
++			out = append(out, r)
++		}
++	}
++	return out
++}
++
+ func newSeededStore() *Store {
+ 	s := &Store{
+ 		users:    map[string]*User{},

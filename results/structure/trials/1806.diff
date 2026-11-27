@@ -1,0 +1,322 @@
+diff --git a/README.md b/README.md
+index 5e9b8ea..e7dfd6b 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/members/{uid}/move` | `{"toProjectId"}` → 200 `{"userId","projectId","role"}` |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -34,6 +35,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Only managers may delete tasks.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
++- Moving a member (team transfer) needs the `manager` role in both the source and the destination project. The user leaves the source project, joins the destination with the same role, and any tasks they hold in the source project are unassigned. The destination must be in the same organization. If the user is not a member of the source → 404; if they are already a member of the destination → 409. Archived projects (source or destination) → 409.
+ 
+ ## Seed data
+ 
+diff --git a/main.go b/main.go
+index a75fde4..a28e635 100644
+--- a/main.go
++++ b/main.go
+@@ -25,6 +25,9 @@ import (
+ //   - only managers may delete tasks
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
++//   - moving a member needs manager role in both projects;
++//     the moved user keeps their role, loses their tasks in the source project,
++//     and the move is rejected if they are already in the destination (409)
+ 
+ func main() {
+ 	addr := flag.String("addr", ":8080", "listen address")
+@@ -49,6 +52,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/members/{uid}/move", s.moveMember)
+ 	return &appHandler{Handler: mux, db: db}
+ }
+ 
+@@ -464,3 +468,126 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	w.WriteHeader(204)
+ }
++
++type moveRequest struct {
++	ToProjectID string `json:"toProjectId"`
++}
++
++// moveMember takes {uid} out of {pid} and adds them to toProjectId with the same
++// role. Tasks they hold in {pid} are unassigned, so no task is left with an
++// assignee who is no longer a member of its project.
++func (s *server) moveMember(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role, err := findRole(ctx, s.db, project.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req moveRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	if req.ToProjectID == project.ID {
++		writeError(w, 400, "destination must be a different project")
++		return
++	}
++	targetID := r.PathValue("uid")
++	memberRole, err := findRole(ctx, s.db, project.ID, targetID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if memberRole == "" {
++		writeError(w, 404, "not found")
++		return
++	}
++	dest, err := findProject(ctx, s.db, req.ToProjectID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if dest == nil || dest.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	destRole, err := findRole(ctx, s.db, dest.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if destRole == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if destRole != RoleManager {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if dest.Archived {
++		writeError(w, 409, "destination project is archived")
++		return
++	}
++	existingRole, err := findRole(ctx, s.db, dest.ID, targetID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if existingRole != "" {
++		writeError(w, 409, "user is already a member of the destination project")
++		return
++	}
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET assignee = '' WHERE project_id = ? AND assignee = ?`, project.ID, targetID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE project_id = ? AND user_id = ?`, project.ID, targetID); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if _, err := tx.ExecContext(ctx, `INSERT INTO memberships (project_id, user_id, role) VALUES (?, ?, ?)`, dest.ID, targetID, memberRole); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, map[string]string{"userId": targetID, "projectId": dest.ID, "role": memberRole})
++}
+diff --git a/members_test.go b/members_test.go
+new file mode 100644
+index 0000000..3532623
+--- /dev/null
++++ b/members_test.go
+@@ -0,0 +1,147 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"testing"
++)
++
++// POST /projects/{pid}/members/{uid}/move with {"toProjectId": ...} removes the
++// user from the project and adds them to the destination with the same role.
++// Seed facts used below: ivy is a manager of web and ops; ann is a manager of
++// web and a viewer of ops; ben is a contributor of web (and of legacy, archived);
++// cat is a contributor of web and ops; dan is a viewer of web; eve is an org
++// admin of acme with no project roles; gus is in globex.
++
++func TestMoveMemberAccess(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"manager moves contributor", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 200},
++		{"manager moves viewer", "ivy", "/projects/web/members/dan/move", `{"toProjectId":"ops"}`, 200},
++		{"contributor caller", "ben", "/projects/web/members/cat/move", `{"toProjectId":"ops"}`, 403},
++		{"viewer caller", "dan", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"org admin caller", "eve", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"non member caller", "hal", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 404},
++		{"other org caller", "gus", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 404},
++		{"anonymous", "", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 401},
++		{"unknown source project", "ivy", "/projects/nope/members/ben/move", `{"toProjectId":"ops"}`, 404},
++		{"user not in source project", "ivy", "/projects/web/members/eve/move", `{"toProjectId":"ops"}`, 404},
++		{"unknown user", "ivy", "/projects/web/members/zed/move", `{"toProjectId":"ops"}`, 404},
++		{"manager of source only", "ann", "/projects/web/members/ben/move", `{"toProjectId":"ops"}`, 403},
++		{"unknown destination", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"nope"}`, 404},
++		{"destination in other org", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"gx"}`, 404},
++		{"destination archived", "ann", "/projects/web/members/cat/move", `{"toProjectId":"legacy"}`, 409},
++		{"source archived", "ann", "/projects/legacy/members/ben/move", `{"toProjectId":"ops"}`, 409},
++		{"already a member of destination", "ivy", "/projects/web/members/cat/move", `{"toProjectId":"ops"}`, 409},
++		{"same project", "ivy", "/projects/web/members/ben/move", `{"toProjectId":"web"}`, 400},
++		{"missing destination", "ivy", "/projects/web/members/ben/move", `{}`, 400},
++		{"empty destination", "ivy", "/projects/web/members/ben/move", `{"toProjectId":""}`, 400},
++		{"invalid body", "ivy", "/projects/web/members/ben/move", `not json`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveMemberResponseAndMembership(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200: %s", code, body)
++	}
++	var got struct {
++		UserID    string `json:"userId"`
++		ProjectID string `json:"projectId"`
++		Role      string `json:"role"`
++	}
++	if err := json.Unmarshal([]byte(body), &got); err != nil {
++		t.Fatalf("bad response %q: %v", body, err)
++	}
++	if got.UserID != "ben" || got.ProjectID != "ops" || got.Role != "contributor" {
++		t.Fatalf("got %+v, want userId ben, projectId ops, role contributor", got)
++	}
++	if role := memberRole(t, h, "web", "ben"); role != "" {
++		t.Fatalf("ben still has role %q in web", role)
++	}
++	if role := memberRole(t, h, "ops", "ben"); role != "contributor" {
++		t.Fatalf("ben has role %q in ops, want contributor", role)
++	}
++}
++
++func TestMoveMemberKeepsAccessFollowingTheMove(t *testing.T) {
++	h := newServer()
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 200 {
++		t.Fatalf("before move: ben reads web got %d want 200", code)
++	}
++	if code, _ := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`); code != 200 {
++		t.Fatalf("move got %d want 200", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks", "ben", ""); code != 404 {
++		t.Fatalf("after move: ben reads web got %d want 404", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks", "ben", ""); code != 200 {
++		t.Fatalf("after move: ben reads ops got %d want 200", code)
++	}
++}
++
++func TestMoveMemberUnassignsTasksInSourceProject(t *testing.T) {
++	h := newServer()
++	// t1 in web is assigned to ben.
++	if code, _ := do(t, h, "POST", "/projects/web/members/ben/move", "ivy", `{"toProjectId":"ops"}`); code != 200 {
++		t.Fatalf("move got %d want 200", code)
++	}
++	code, body := do(t, h, "GET", "/projects/web/tasks/t1", "ivy", "")
++	if code != 200 {
++		t.Fatalf("get t1 got %d want 200", code)
++	}
++	var task Task
++	if err := json.Unmarshal([]byte(body), &task); err != nil {
++		t.Fatal(err)
++	}
++	if task.Assignee != "" {
++		t.Fatalf("t1 still assigned to %q after ben left web", task.Assignee)
++	}
++}
++
++func TestFailedMoveChangesNothing(t *testing.T) {
++	h := newServer()
++	// Destination is archived: rejected before anything is written.
++	if code, _ := do(t, h, "POST", "/projects/web/members/cat/move", "ann", `{"toProjectId":"legacy"}`); code != 409 {
++		t.Fatalf("got %d want 409", code)
++	}
++	// cat is already in ops: rejected, and the source membership must survive.
++	if code, _ := do(t, h, "POST", "/projects/web/members/cat/move", "ivy", `{"toProjectId":"ops"}`); code != 409 {
++		t.Fatalf("got %d want 409", code)
++	}
++	if role := memberRole(t, h, "web", "cat"); role != "contributor" {
++		t.Fatalf("cat's web role is %q after failed moves, want contributor", role)
++	}
++	if role := memberRole(t, h, "legacy", "cat"); role != "" {
++		t.Fatalf("cat gained role %q in legacy after a failed move", role)
++	}
++	if role := memberRole(t, h, "ops", "cat"); role != "contributor" {
++		t.Fatalf("cat's ops role is %q, want contributor (unchanged)", role)
++	}
++}
++
++// memberRole reads a membership straight from the database.
++func memberRole(t *testing.T, h http.Handler, projectID, userID string) string {
++	t.Helper()
++	app, ok := h.(*appHandler)
++	if !ok {
++		t.Fatalf("memberRole: %T is not the handler built by newServer", h)
++	}
++	role, err := findRole(context.Background(), app.db, projectID, userID)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return role
++}

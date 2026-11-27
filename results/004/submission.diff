@@ -1,0 +1,216 @@
+diff --git a/README.md b/README.md
+index a64e87d..bd814e6 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,7 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| POST | `/projects/{pid}/tasks/{tid}/move` | `{"toProjectId"}` → 200 with the moved task |
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+@@ -30,6 +31,8 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
+ - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
+ - Only managers may delete tasks.
++- Moving a task needs write access to both projects: in the source project the same rules as editing apply (contributors only for their own tasks), and in the destination the user must be a `contributor` or `manager`. A destination that is missing, in another organization, or not readable by the user → 404; readable but not writable → 403; archived → 409; the same project → 400.
++- A move keeps the task's ID, title, status and assignee. The assignee is not re-checked against the destination project's roles.
+ - Archived projects reject all writes with 409 (reads still work).
+ - A task ID that does not belong to the project in the path → 404.
+ 
+diff --git a/main.go b/main.go
+index 6152a73..0e0ceee 100644
+--- a/main.go
++++ b/main.go
+@@ -20,6 +20,9 @@ import (
+ //   - contributors may only modify tasks assigned to themselves
+ //     and may not reassign tasks; managers may modify any task
+ //   - only managers may delete tasks
++//   - moving a task requires write access to both the source project
++//     (contributors only for their own tasks) and the destination project
++//     (contributor or manager there); the task keeps its ID, title, status and assignee
+ //   - archived projects reject all writes                      -> 409
+ //   - a task ID that is not in the path project               -> 404
+ 
+@@ -35,13 +38,18 @@ type server struct {
+ }
+ 
+ func newServer() http.Handler {
+-	s := &server{store: newSeededStore()}
++	return newServerWithStore(newSeededStore())
++}
++
++func newServerWithStore(st *Store) http.Handler {
++	s := &server{store: st}
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("GET /projects/{pid}/tasks", s.listTasks)
+ 	mux.HandleFunc("POST /projects/{pid}/tasks", s.createTask)
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("POST /projects/{pid}/tasks/{tid}/move", s.moveTask)
+ 	return mux
+ }
+ 
+@@ -282,3 +290,75 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
+ 	s.store.DeleteTask(task.ID)
+ 	w.WriteHeader(204)
+ }
++
++type moveRequest struct {
++	ToProjectID string `json:"toProjectId"`
++}
++
++func (s *server) moveTask(w http.ResponseWriter, r *http.Request) {
++	s.store.mu.Lock()
++	defer s.store.mu.Unlock()
++
++	user := s.store.User(r.Header.Get("X-User"))
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project := s.store.Project(r.PathValue("pid"))
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role := s.store.Role(project.ID, user.ID)
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	task := s.store.Task(r.PathValue("tid"))
++	if task == nil || task.ProjectID != project.ID {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager && role != RoleContributor {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if role == RoleContributor && task.Assignee != user.ID {
++		writeError(w, 403, "contributors may only move their own tasks")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req moveRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ToProjectID == "" {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++	target := s.store.Project(req.ToProjectID)
++	if target == nil || target.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	targetRole := s.store.Role(target.ID, user.ID)
++	if targetRole == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if targetRole != RoleManager && targetRole != RoleContributor {
++		writeError(w, 403, "forbidden")
++		return
++	}
++	if target.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	if target.ID == project.ID {
++		writeError(w, 400, "task is already in that project")
++		return
++	}
++	// The task keeps its ID, title, status and assignee; only its project changes.
++	task.ProjectID = target.ID
++	writeJSON(w, 200, task)
++}
+diff --git a/main_test.go b/main_test.go
+index 0277f51..7933855 100644
+--- a/main_test.go
++++ b/main_test.go
+@@ -113,6 +113,80 @@ func TestUpdate(t *testing.T) {
+ 	}
+ }
+ 
++func TestMove(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"contributor own", "cat", "/projects/web/tasks/t2/move", `{"toProjectId":"ops"}`, 200},
++		{"contributor others", "ben", "/projects/web/tasks/t2/move", `{"toProjectId":"ops"}`, 403},
++		{"contributor dest not member", "ben", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 404},
++		{"viewer dest", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
++		{"viewer source", "dan", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
++		{"org admin source", "eve", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 403},
++		{"non member source", "hal", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 404},
++		{"other org source", "gus", "/projects/gx/tasks/t6/move", `{"toProjectId":"ops"}`, 404},
++		{"other org dest", "gus", "/projects/gx/tasks/t6/move", `{"toProjectId":"web"}`, 404},
++		{"missing dest", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"nope"}`, 404},
++		{"archived source", "ann", "/projects/legacy/tasks/t5/move", `{"toProjectId":"ops"}`, 409},
++		{"archived dest", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"legacy"}`, 409},
++		{"same project", "ann", "/projects/web/tasks/t1/move", `{"toProjectId":"web"}`, 400},
++		{"empty dest", "ann", "/projects/web/tasks/t1/move", `{}`, 400},
++		{"bad json", "ann", "/projects/web/tasks/t1/move", `not json`, 400},
++		{"task not in path project", "ann", "/projects/ops/tasks/t1/move", `{"toProjectId":"web"}`, 404},
++		{"anonymous", "", "/projects/web/tasks/t1/move", `{"toProjectId":"ops"}`, 401},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			code, _ := do(t, newServer(), "POST", c.path, c.user, c.body)
++			if code != c.want {
++				t.Fatalf("got %d want %d", code, c.want)
++			}
++		})
++	}
++}
++
++func TestMoveKeepsTaskFields(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "POST", "/projects/web/tasks/t2/move", "cat", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("move: got %d body %s", code, body)
++	}
++	var moved Task
++	if err := json.Unmarshal([]byte(body), &moved); err != nil {
++		t.Fatal(err)
++	}
++	want := Task{ID: "t2", ProjectID: "ops", Title: "Update footer", Status: "doing", Assignee: "cat"}
++	if moved != want {
++		t.Fatalf("moved task = %+v, want %+v", moved, want)
++	}
++
++	// The task now belongs to ops and is gone from web.
++	_, opsBody := do(t, h, "GET", "/projects/ops/tasks", "ann", "")
++	if !strings.Contains(opsBody, `"id":"t2"`) {
++		t.Fatalf("t2 missing from ops list: %s", opsBody)
++	}
++	_, webBody := do(t, h, "GET", "/projects/web/tasks", "ann", "")
++	if strings.Contains(webBody, `"id":"t2"`) {
++		t.Fatalf("t2 still listed in web: %s", webBody)
++	}
++	if code, _ := do(t, h, "GET", "/projects/web/tasks/t2", "ann", ""); code != 404 {
++		t.Fatalf("old path: got %d want 404", code)
++	}
++	if code, _ := do(t, h, "GET", "/projects/ops/tasks/t2", "cat", ""); code != 200 {
++		t.Fatalf("new path: got %d want 200", code)
++	}
++}
++
++func TestMoveByManagerOfBothProjects(t *testing.T) {
++	st := newSeededStore()
++	st.members["ops"]["ann"] = RoleManager
++	code, body := do(t, newServerWithStore(st), "POST", "/projects/web/tasks/t2/move", "ann", `{"toProjectId":"ops"}`)
++	if code != 200 {
++		t.Fatalf("got %d want 200, body %s", code, body)
++	}
++}
++
+ func TestDelete(t *testing.T) {
+ 	cases := []struct {
+ 		name, user, path string

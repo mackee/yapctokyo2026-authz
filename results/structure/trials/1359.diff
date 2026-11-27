@@ -1,0 +1,353 @@
+diff --git a/README.md b/README.md
+index 49b55af..a64c0a4 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,11 @@ go test ./...
+ | GET | `/projects/{pid}/tasks/{tid}` | |
+ | PATCH | `/projects/{pid}/tasks/{tid}` | `{"title"?,"status"?,"assignee"?}` → 200 |
+ | DELETE | `/projects/{pid}/tasks/{tid}` | → 204 |
++| PUT | `/projects/{pid}/members` | `{"roles":{"ben":"viewer"}}` → 200 `[{"userId","role"}]` (all members, sorted) |
++
++`PUT .../members` is manager-only and all-or-nothing. Roles are `manager`, `contributor`
++or `viewer`. 400 if a role is invalid or a user is not a member; 409 if the project is
++archived, or if a member would become `viewer` while still assigned a task in the project.
+ 
+ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
+ 
+diff --git a/main.go b/main.go
+index 647c0d2..62e5652 100644
+--- a/main.go
++++ b/main.go
+@@ -49,6 +49,7 @@ func newServer() http.Handler {
+ 	mux.HandleFunc("GET /projects/{pid}/tasks/{tid}", s.getTask)
+ 	mux.HandleFunc("PATCH /projects/{pid}/tasks/{tid}", s.updateTask)
+ 	mux.HandleFunc("DELETE /projects/{pid}/tasks/{tid}", s.deleteTask)
++	mux.HandleFunc("PUT /projects/{pid}/members", s.setMemberRoles)
+ 	return mux
+ }
+ 
+diff --git a/members.go b/members.go
+new file mode 100644
+index 0000000..5d5e1ac
+--- /dev/null
++++ b/members.go
+@@ -0,0 +1,135 @@
++package main
++
++import (
++	"database/sql"
++	"encoding/json"
++	"errors"
++	"net/http"
++)
++
++type setRolesRequest struct {
++	Roles map[string]string `json:"roles"`
++}
++
++type memberView struct {
++	UserID string `json:"userId"`
++	Role   string `json:"role"`
++}
++
++// setMemberRoles implements PUT /projects/{pid}/members (see setRolesOutcome in
++// spec/taskboard.qnt). It is all-or-nothing: every check runs before any write,
++// and the writes happen in one transaction.
++//
++//	401 unknown user; 404 project not readable; 403 caller is not a manager;
++//	409 archived; 400 bad body / unknown role / target not a member;
++//	409 demoting to viewer a member who is still assigned a task in the project.
++func (s *server) setMemberRoles(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	user, err := findUser(ctx, s.db, r.Header.Get("X-User"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if user == nil {
++		writeError(w, 401, "unauthenticated")
++		return
++	}
++	project, err := findProject(ctx, s.db, r.PathValue("pid"))
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if project == nil || project.OrgID != user.OrgID {
++		writeError(w, 404, "not found")
++		return
++	}
++	role, err := findRole(ctx, s.db, project.ID, user.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if role == "" && !user.OrgAdmin {
++		writeError(w, 404, "not found")
++		return
++	}
++	if role != RoleManager {
++		writeError(w, 403, "only managers may change member roles")
++		return
++	}
++	if project.Archived {
++		writeError(w, 409, "project is archived")
++		return
++	}
++	var req setRolesRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Roles == nil {
++		writeError(w, 400, "invalid request body")
++		return
++	}
++
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	defer tx.Rollback()
++
++	for uid, newRole := range req.Roles {
++		if newRole != RoleManager && newRole != RoleContributor && newRole != RoleViewer {
++			writeError(w, 400, "invalid role for "+uid)
++			return
++		}
++		var one int
++		err := tx.QueryRowContext(ctx, `SELECT 1 FROM memberships WHERE project_id = ? AND user_id = ?`, project.ID, uid).Scan(&one)
++		if err != nil {
++			if errors.Is(err, sql.ErrNoRows) {
++				writeError(w, 400, uid+" is not a member of the project")
++				return
++			}
++			writeError(w, 500, "internal error")
++			return
++		}
++		if newRole == RoleViewer {
++			var assigned int
++			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE project_id = ? AND assignee = ?`, project.ID, uid).Scan(&assigned); err != nil {
++				writeError(w, 500, "internal error")
++				return
++			}
++			if assigned > 0 {
++				writeError(w, 409, uid+" still has assigned tasks; reassign them first")
++				return
++			}
++		}
++	}
++	for uid, newRole := range req.Roles {
++		if _, err := tx.ExecContext(ctx, `UPDATE memberships SET role = ? WHERE project_id = ? AND user_id = ?`, newRole, project.ID, uid); err != nil {
++			writeError(w, 500, "internal error")
++			return
++		}
++	}
++
++	rows, err := tx.QueryContext(ctx, `SELECT user_id, role FROM memberships WHERE project_id = ? ORDER BY user_id`, project.ID)
++	if err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	members := []memberView{}
++	for rows.Next() {
++		var m memberView
++		if err := rows.Scan(&m.UserID, &m.Role); err != nil {
++			rows.Close()
++			writeError(w, 500, "internal error")
++			return
++		}
++		members = append(members, m)
++	}
++	rows.Close()
++	if err := rows.Err(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	if err := tx.Commit(); err != nil {
++		writeError(w, 500, "internal error")
++		return
++	}
++	writeJSON(w, 200, members)
++}
+diff --git a/members_test.go b/members_test.go
+new file mode 100644
+index 0000000..7438de7
+--- /dev/null
++++ b/members_test.go
+@@ -0,0 +1,107 @@
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++	"testing"
++)
++
++func memberRoles(t *testing.T, body string) map[string]string {
++	t.Helper()
++	var ms []memberView
++	if err := json.Unmarshal([]byte(body), &ms); err != nil {
++		t.Fatalf("bad body %q: %v", body, err)
++	}
++	out := map[string]string{}
++	for _, m := range ms {
++		out[m.UserID] = m.Role
++	}
++	return out
++}
++
++func TestSetMemberRoles(t *testing.T) {
++	h := newServer()
++	code, body := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"dan":"contributor","ivy":"viewer"}}`)
++	if code != 200 {
++		t.Fatalf("got %d %s", code, body)
++	}
++	got := memberRoles(t, body)
++	want := map[string]string{"ann": "manager", "ben": "contributor", "cat": "contributor", "dan": "contributor", "ivy": "viewer"}
++	if len(got) != len(want) {
++		t.Fatalf("got %v", got)
++	}
++	for k, v := range want {
++		if got[k] != v {
++			t.Errorf("%s: got %q want %q", k, got[k], v)
++		}
++	}
++	// dan can now modify... only own tasks, but is a writer: creating is allowed.
++	if code, _ := do(t, h, "POST", "/projects/web/tasks", "dan", `{"title":"x"}`); code != 200 {
++		t.Errorf("dan create after promotion: %d", code)
++	}
++}
++
++func TestSetMemberRolesDemoteAfterUnassign(t *testing.T) {
++	h := newServer()
++	if code, _ := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"ben":"viewer"}}`); code != 409 {
++		t.Fatalf("ben still assigned t1: got %d", code)
++	}
++	if code, _ := do(t, h, "PATCH", "/projects/web/tasks/t1", "ann", `{"assignee":""}`); code != 200 {
++		t.Fatalf("unassign: %d", code)
++	}
++	code, body := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{"ben":"viewer"}}`)
++	if code != 200 || memberRoles(t, body)["ben"] != "viewer" {
++		t.Fatalf("got %d %s", code, body)
++	}
++}
++
++func TestSetMemberRolesErrors(t *testing.T) {
++	cases := []struct {
++		name, user, path, body string
++		want                   int
++	}{
++		{"no user", "", "/projects/web/members", `{"roles":{}}`, 401},
++		{"unknown user", "nobody", "/projects/web/members", `{"roles":{}}`, 401},
++		{"no project", "ann", "/projects/missing/members", `{"roles":{}}`, 404},
++		{"other org", "gus", "/projects/web/members", `{"roles":{}}`, 404},
++		{"non member", "hal", "/projects/web/members", `{"roles":{}}`, 404},
++		{"contributor", "ben", "/projects/web/members", `{"roles":{"dan":"viewer"}}`, 403},
++		{"viewer", "dan", "/projects/web/members", `{"roles":{"dan":"manager"}}`, 403},
++		{"org admin", "eve", "/projects/web/members", `{"roles":{"dan":"viewer"}}`, 403},
++		{"archived", "ann", "/projects/legacy/members", `{"roles":{"ben":"manager"}}`, 409},
++		{"bad role", "ann", "/projects/web/members", `{"roles":{"dan":"boss"}}`, 400},
++		{"not a member", "ann", "/projects/web/members", `{"roles":{"hal":"viewer"}}`, 400},
++		{"member of other project", "ann", "/projects/web/members", `{"roles":{"gus":"viewer"}}`, 400},
++		{"bad json", "ann", "/projects/web/members", `nope`, 400},
++		{"missing roles", "ann", "/projects/web/members", `{}`, 400},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			h := newServer()
++			if code, body := do(t, h, "PUT", c.path, c.user, c.body); code != c.want {
++				t.Errorf("got %d %s, want %d", code, body, c.want)
++			}
++		})
++	}
++}
++
++// One bad entry must leave every other entry unchanged.
++func TestSetMemberRolesAtomic(t *testing.T) {
++	h := newServer()
++	for _, body := range []string{
++		`{"roles":{"dan":"contributor","hal":"viewer"}}`,
++		`{"roles":{"dan":"contributor","ben":"viewer"}}`,
++		`{"roles":{"dan":"contributor","cat":"boss"}}`,
++	} {
++		if code, _ := do(t, h, "PUT", "/projects/web/members", "ann", body); code == http.StatusOK {
++			t.Fatalf("%s: expected error", body)
++		}
++	}
++	code, body := do(t, h, "PUT", "/projects/web/members", "ann", `{"roles":{}}`)
++	if code != 200 {
++		t.Fatalf("got %d", code)
++	}
++	if got := memberRoles(t, body); got["dan"] != "viewer" || got["ben"] != "contributor" || got["cat"] != "contributor" {
++		t.Errorf("state changed: %v", got)
++	}
++}
+diff --git a/spec/taskboard.qnt b/spec/taskboard.qnt
+index fe78764..7399f7d 100644
+--- a/spec/taskboard.qnt
++++ b/spec/taskboard.qnt
+@@ -123,6 +123,21 @@ module taskboard {
+     else if (projects.get(p).archived) 409
+     else 204
+ 
++  // PUT /projects/{pid}/members {"roles": {user: role, ...}}
++  // All-or-nothing: only managers may change roles; every target must be a
++  // current member and every role valid; a member who is the assignee of a
++  // task in the project cannot be demoted to viewer (would break
++  // inv_assigneeIsWriter) -> 409.
++  def setRolesOutcome(u: UserId, p: ProjectId, rs: UserId -> Role): int =
++    if (not(userExists(u))) 401
++    else if (not(canRead(u, p))) 404
++    else if (roleOf(p, u) != "manager") 403
++    else if (projects.get(p).archived) 409
++    else if (rs.keys().exists(k => not(members.keys().contains((p, k))) or not(ROLES.contains(rs.get(k))))) 400
++    else if (rs.keys().exists(k => rs.get(k) == "viewer" and
++        tasks.keys().exists(t => tasks.get(t).project == p and tasks.get(t).assignee == k))) 409
++    else 200
++
+   // ---- actions -------------------------------------------------------------
+ 
+   action unchanged = all {
+@@ -164,6 +179,16 @@ module taskboard {
+       members' = members,
+     } else unchanged
+ 
++  action setRoles(u: UserId, p: ProjectId, rs: UserId -> Role): bool =
++    if (setRolesOutcome(u, p, rs) == 200) all {
++      members' = members.keys().mapBy(k =>
++        if (k._1 == p and rs.keys().contains(k._2)) rs.get(k._2) else members.get(k)),
++      tasks' = tasks,
++      nextTask' = nextTask,
++      users' = users,
++      projects' = projects,
++    } else unchanged
++
+   // ---- seed data and steps -------------------------------------------------
+ 
+   action init = all {
+@@ -202,7 +227,13 @@ module taskboard {
+     nondet t = 1.to(nextTask).oneOf()
+     nondet s = STATUSES.oneOf()
+     nondet changeAssignee = Set(true, false).oneOf()
++    nondet u2 = USERS.oneOf()
++    nondet r1 = ROLES.union(Set("bogus")).oneOf()
++    nondet r2 = ROLES.union(Set("bogus")).oneOf()
++    nondet n = Set(0, 1, 2).oneOf()
++    val rs = if (n == 0) Map() else if (n == 1) Map(a -> r1) else Map(a -> r1, u2 -> r2)
+     any {
++      setRoles(u, p, rs),
+       createTask(u, p, a),
+       updateTask(u, p, t, s, changeAssignee, a),
+       deleteTask(u, p, t),
+@@ -230,6 +261,13 @@ module taskboard {
+       assert(deleteOutcome("ann", "web", 1) == 204),
+       assert(deleteOutcome("ben", "web", 1) == 403),
+       assert(deleteOutcome("ann", "web", 4) == 404),
++      assert(setRolesOutcome("ann", "web", Map("dan" -> "contributor")) == 200),
++      assert(setRolesOutcome("ann", "web", Map("ben" -> "viewer")) == 409),
++      assert(setRolesOutcome("ann", "web", Map("dan" -> "boss")) == 400),
++      assert(setRolesOutcome("ann", "web", Map("hal" -> "viewer")) == 400),
++      assert(setRolesOutcome("ben", "web", Map("dan" -> "viewer")) == 403),
++      assert(setRolesOutcome("eve", "web", Map("dan" -> "viewer")) == 403),
++      assert(setRolesOutcome("ann", "legacy", Map("ben" -> "manager")) == 409),
+       unchanged,
+     })
+ }
