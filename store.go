@@ -9,7 +9,7 @@ import (
 type User struct {
 	ID       string
 	OrgID    string
-	OrgAdmin bool // org admins may read every project in their org, but cannot write
+	OrgAdmin bool // org admins may read every project in their org and act as its managers
 }
 
 type Project struct {

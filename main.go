@@ -15,6 +15,7 @@ import (
 //   - unknown or missing user                                  -> 401
 //   - project missing, in another org, or not readable by user -> 404
 //   - a project is readable by its members (any role) and by org admins of its org
+//   - org admins act as managers in every project of their org
 //   - writes need contributor or manager role in the project;
 //     readable-but-not-allowed                                 -> 403
 //   - contributors may only modify tasks assigned to themselves
@@ -45,6 +46,16 @@ func newServer() http.Handler {
 	return mux
 }
 
+// effectiveRole returns the role used for authorization checks. An org admin
+// acts as a manager in every project of their organization; otherwise the
+// project membership role (possibly "") applies.
+func effectiveRole(memberRole string, user *User) string {
+	if user.OrgAdmin {
+		return RoleManager
+	}
+	return memberRole
+}
+
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -69,7 +80,7 @@ func (s *server) listTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
+	role := effectiveRole(s.store.Role(project.ID, user.ID), user)
 	if role == "" && !user.OrgAdmin {
 		writeError(w, 404, "not found")
 		return
@@ -95,7 +106,7 @@ func (s *server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
+	role := effectiveRole(s.store.Role(project.ID, user.ID), user)
 	if role == "" && !user.OrgAdmin {
 		writeError(w, 404, "not found")
 		return
@@ -127,7 +138,7 @@ func (s *server) createTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
+	role := effectiveRole(s.store.Role(project.ID, user.ID), user)
 	if role == "" && !user.OrgAdmin {
 		writeError(w, 404, "not found")
 		return
@@ -187,7 +198,7 @@ func (s *server) updateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
+	role := effectiveRole(s.store.Role(project.ID, user.ID), user)
 	if role == "" && !user.OrgAdmin {
 		writeError(w, 404, "not found")
 		return
@@ -261,7 +272,7 @@ func (s *server) deleteTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not found")
 		return
 	}
-	role := s.store.Role(project.ID, user.ID)
+	role := effectiveRole(s.store.Role(project.ID, user.ID), user)
 	if role == "" && !user.OrgAdmin {
 		writeError(w, 404, "not found")
 		return

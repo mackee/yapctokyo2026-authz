@@ -71,9 +71,13 @@ func TestCreate(t *testing.T) {
 		{"contributor assigns other", "ben", "web", `{"title":"x","assignee":"cat"}`, 403},
 		{"manager assigns", "ann", "web", `{"title":"x","assignee":"cat"}`, 201},
 		{"viewer", "dan", "web", `{"title":"x"}`, 403},
-		{"org admin", "eve", "web", `{"title":"x"}`, 403},
+		{"org admin", "eve", "web", `{"title":"x"}`, 201},
+		{"org admin assigns other", "eve", "web", `{"title":"x","assignee":"cat"}`, 201},
+		{"org admin non-member project", "eve", "ops", `{"title":"x"}`, 201},
+		{"org admin other org", "eve", "gx", `{"title":"x"}`, 404},
 		{"non member", "hal", "web", `{"title":"x"}`, 404},
 		{"archived", "ann", "legacy", `{"title":"x"}`, 409},
+		{"org admin archived", "eve", "legacy", `{"title":"x"}`, 409},
 		{"empty title", "ann", "web", `{"title":""}`, 400},
 		{"assignee viewer", "ann", "web", `{"title":"x","assignee":"dan"}`, 400},
 	}
@@ -97,10 +101,14 @@ func TestUpdate(t *testing.T) {
 		{"contributor reassign", "ben", "/projects/web/tasks/t1", `{"assignee":"cat"}`, 403},
 		{"manager any", "ann", "/projects/web/tasks/t2", `{"status":"done","assignee":"ben"}`, 200},
 		{"viewer", "dan", "/projects/web/tasks/t1", `{"status":"done"}`, 403},
-		{"org admin", "eve", "/projects/web/tasks/t1", `{"status":"done"}`, 403},
+		{"org admin", "eve", "/projects/web/tasks/t1", `{"status":"done"}`, 200},
+		{"org admin any task", "eve", "/projects/web/tasks/t2", `{"status":"done","assignee":"ben"}`, 200},
+		{"org admin non-member project", "eve", "/projects/ops/tasks/t4", `{"title":"y"}`, 200},
+		{"org admin other org", "eve", "/projects/gx/tasks/t6", `{"status":"done"}`, 404},
 		{"cross project id", "ann", "/projects/web/tasks/t4", `{"status":"done"}`, 404},
 		{"cross org", "gus", "/projects/web/tasks/t1", `{"status":"done"}`, 404},
 		{"archived", "ann", "/projects/legacy/tasks/t5", `{"status":"done"}`, 409},
+		{"org admin archived", "eve", "/projects/legacy/tasks/t5", `{"status":"done"}`, 409},
 		{"bad status", "ann", "/projects/web/tasks/t1", `{"status":"nope"}`, 400},
 	}
 	for _, c := range cases {
@@ -120,7 +128,11 @@ func TestDelete(t *testing.T) {
 	}{
 		{"manager", "ann", "/projects/web/tasks/t1", 204},
 		{"contributor own", "ben", "/projects/web/tasks/t1", 403},
+		{"org admin", "eve", "/projects/web/tasks/t2", 204},
+		{"org admin non-member project", "eve", "/projects/ops/tasks/t4", 204},
+		{"org admin other org", "eve", "/projects/gx/tasks/t6", 404},
 		{"archived", "ann", "/projects/legacy/tasks/t5", 409},
+		{"org admin archived", "eve", "/projects/legacy/tasks/t5", 409},
 		{"cross project", "ann", "/projects/web/tasks/t4", 404},
 	}
 	for _, c := range cases {

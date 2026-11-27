@@ -27,6 +27,7 @@ Statuses: `open`, `doing`, `done`. Errors are `{"error":"..."}`.
 - Unknown or missing user → 401.
 - Project missing, in another organization, or not readable by the user → 404.
 - A project is readable by its members (any role) and by org admins of the same organization.
+- Org admins act as `manager` in every project of their organization (they may create, edit, reassign and delete tasks, including in projects they are not members of). They still cannot touch projects in other organizations (404) or archived projects (409).
 - Writes require the `contributor` or `manager` role in the project. Users who can read but not write get 403.
 - Contributors may only modify tasks assigned to themselves, and may not reassign tasks. Managers may modify any task.
 - Only managers may delete tasks.
